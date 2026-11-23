@@ -34,8 +34,7 @@ juce::AudioProcessorValueTreeState::ParameterLayout DustyTableProcessor::createL
     ps.push_back(std::make_unique<AudioParameterChoice>(ParameterID { "disc", 1 }, "Disc", StringArray { "12\"", "10\"", "7\"" }, 0));
     ps.push_back(std::make_unique<AudioParameterChoice>(ParameterID { "stylus", 1 }, "Stylus", StringArray { "Conical", "Elliptical" }, 0));
     ps.push_back(std::make_unique<P>(ParameterID { "vtf", 1 }, "Tracking Force", NormalisableRange<float>(0.75f, 4.0f, 0.05f), 2.0f, Attr().withLabel("g")));
-    ps.push_back(std::make_unique<P>(ParameterID { "position", 1 }, "Position", NormalisableRange<float>(0.0f, 100.0f, 0.1f), 0.0f, pct));
-    ps.push_back(std::make_unique<AudioParameterBool>(ParameterID { "auto", 1 }, "Auto Advance", true));
+    ps.push_back(std::make_unique<P>(ParameterID { "position", 1 }, "Drop Point", NormalisableRange<float>(0.0f, 100.0f, 0.1f), 0.0f, pct));
     ps.push_back(std::make_unique<AudioParameterBool>(ParameterID { "arm", 1 }, "Start (on) / Stop (off)", true));
     ps.push_back(std::make_unique<P>(ParameterID { "cue", 1 }, "Cue Damping", NormalisableRange<float>(0.5f, 4.0f, 0.05f), 2.0f, Attr().withLabel("s")));
     ps.push_back(std::make_unique<P>(ParameterID { "side", 1 }, "Side Length", NormalisableRange<float>(1.0f, 40.0f, 0.5f), 20.0f, Attr().withLabel("min")));
@@ -43,11 +42,8 @@ juce::AudioProcessorValueTreeState::ParameterLayout DustyTableProcessor::createL
     ps.push_back(std::make_unique<P>(ParameterID { "dustDensity", 1 }, "Dust Density", skewedRange(0.0f, 60.0f, 0.1f, 8.0f), 6.0f, Attr().withLabel("/m")));
     ps.push_back(std::make_unique<P>(ParameterID { "dustSize", 1 }, "Dust Size", skewedRange(1.0f, 40.0f, 0.1f, 10.0f), 12.0f, Attr().withLabel("um")));
 
-    ps.push_back(std::make_unique<AudioParameterInt>(ParameterID { "scratchCount", 1 }, "Scratches", 0, dustytable::maxScratches, 1));
     ps.push_back(std::make_unique<P>(ParameterID { "scratchDepth", 1 }, "Scratch Depth", skewedRange(2.0f, 60.0f, 0.1f, 15.0f), 15.0f, Attr().withLabel("um")));
-    ps.push_back(std::make_unique<P>(ParameterID { "scratchLength", 1 }, "Scratch Length", NormalisableRange<float>(5.0f, 100.0f, 0.1f), 60.0f, pct));
     ps.push_back(std::make_unique<P>(ParameterID { "scratchPileUp", 1 }, "Scratch Pile-up", skewedRange(0.2f, 4.0f, 0.01f, 1.5f), 1.5f, Attr().withLabel("mm")));
-    ps.push_back(std::make_unique<AudioParameterInt>(ParameterID { "scratchSeed", 1 }, "Scratch Layout", 1, 999, 1));
 
     ps.push_back(std::make_unique<P>(ParameterID { "static", 1 }, "Static Electricity", NormalisableRange<float>(0.0f, 100.0f, 0.1f), 0.0f, pct));
 
@@ -68,16 +64,12 @@ dustytable::EngineParams DustyTableProcessor::readParams() const
     p.discIndex = static_cast<int>(param("disc"));
     p.stylusIndex = static_cast<int>(param("stylus"));
     p.trackingForceGrams = param("vtf");
-    p.position = param("position") * 0.01;
-    p.autoAdvance = param("auto") > 0.5f;
+    p.dropPosition = param("position") * 0.01;
     p.sideMinutes = param("side");
     p.dustPerMetre = param("dustDensity");
     p.dustMaxMicrons = param("dustSize");
-    p.scratchCount = static_cast<int>(param("scratchCount"));
     p.scratchDepthMicrons = param("scratchDepth");
-    p.scratchLength = param("scratchLength") * 0.01;
     p.scratchPileUpMillimetres = param("scratchPileUp");
-    p.scratchSeed = static_cast<int>(param("scratchSeed"));
     p.staticAmount = param("static") * 0.01;
     p.armDown = param("arm") > 0.5f;
     p.cueSeconds = param("cue");
@@ -89,7 +81,13 @@ void DustyTableProcessor::prepareToPlay(double sampleRate, int samplesPerBlock)
     engine.prepare(sampleRate);
     const auto p = readParams();
     engine.setParams(p);
+    {
+        const juce::SpinLock::ScopedLockType lock(scratchLock);
+        engine.setScratches(scratchList);
+        scratchVersionApplied = scratchVersion;
+    }
     engine.setArmImmediate(p.armDown);
+    if (const double s = savedStylus.exchange(-1.0); s >= 0.0) engine.setStylusPosition(s);
     armImmediatePending = false;
     noise.setSize(5, samplesPerBlock);
     noiseGain.reset(sampleRate, 0.05);
@@ -118,7 +116,18 @@ void DustyTableProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce::M
     // hand actions.
     const auto params = readParams();
     engine.setParams(params);
-    if (armImmediatePending.exchange(false)) engine.setArmImmediate(params.armDown);
+    if (armImmediatePending.exchange(false)) {
+        engine.setArmImmediate(params.armDown);
+        if (const double s = savedStylus.exchange(-1.0); s >= 0.0) engine.setStylusPosition(s);
+    }
+    {
+        // Never wait on the editor: a change missed here is picked up next block.
+        const juce::SpinLock::ScopedTryLockType lock(scratchLock);
+        if (lock.isLocked() && scratchVersion != scratchVersionApplied) {
+            engine.setScratches(scratchList);
+            scratchVersionApplied = scratchVersion;
+        }
+    }
 
     // Follow the host transport while it plays, so scratches land on the same
     // beat every time a section is replayed; otherwise keep the disc spinning.
@@ -139,7 +148,10 @@ void DustyTableProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce::M
     engine.process(nl, nr, ml, mr, contact, n, t);
 
     uiPhase.store(engine.getPhase());
+    uiPlatterSpeed.store(engine.getPlatterSpeed());
+    uiPhaseStamp.store(juce::Time::getMillisecondCounterHiRes());
     uiPosition.store(engine.getPosition());
+    if (engine.takeEndOfSide()) triggerAsyncUpdate(); // Start/Stop follows the deck stopping itself
     uiRadius.store(engine.getRadius());
     uiArmTransit.store(engine.getArmTransit());
     uiArmHeight.store(engine.getArmHeight());
@@ -171,15 +183,104 @@ void DustyTableProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce::M
 
 juce::AudioProcessorEditor* DustyTableProcessor::createEditor() { return new DustyTableEditor(*this); }
 
+dustytable::ScratchList DustyTableProcessor::getScratches() const
+{
+    const juce::SpinLock::ScopedLockType lock(scratchLock);
+    return scratchList;
+}
+
+void DustyTableProcessor::setScratches(const dustytable::ScratchList& list)
+{
+    const juce::SpinLock::ScopedLockType lock(scratchLock);
+    scratchList = list;
+    ++scratchVersion;
+}
+
+namespace {
+
+const char* const scratchesTag = "SCRATCHES";
+const char* const stylusAttribute = "stylusPosition";
+
+struct ScratchField {
+    const char* name;
+    double dustytable::DrawnScratch::*member;
+};
+constexpr ScratchField scratchFields[] = {
+    { "angle", &dustytable::DrawnScratch::angle },
+    { "twist", &dustytable::DrawnScratch::twist },
+    { "bend", &dustytable::DrawnScratch::bend },
+    { "start", &dustytable::DrawnScratch::uStart },
+    { "end", &dustytable::DrawnScratch::uEnd },
+    { "width", &dustytable::DrawnScratch::widthMicrons },
+    { "depth", &dustytable::DrawnScratch::depthFactor },
+    { "burr", &dustytable::DrawnScratch::burrFactor },
+    { "bulge", &dustytable::DrawnScratch::bulgeFactor },
+    { "height", &dustytable::DrawnScratch::heightFactor },
+};
+
+double savedParam(const juce::XmlElement& xml, const char* id, double fallback)
+{
+    if (auto* e = xml.getChildByAttribute("id", id)) return e->getDoubleAttribute("value", fallback);
+    return fallback;
+}
+
+} // namespace
+
 void DustyTableProcessor::getStateInformation(juce::MemoryBlock& destData)
 {
-    if (auto xml = apvts.copyState().createXml()) copyXmlToBinary(*xml, destData);
+    auto xml = apvts.copyState().createXml();
+    if (xml == nullptr) return;
+    auto* list = xml->createNewChildElement(scratchesTag);
+    const auto scratches = getScratches();
+    for (int i = 0; i < scratches.count; ++i) {
+        const auto& d = scratches.items[static_cast<size_t>(i)];
+        auto* e = list->createNewChildElement("SCRATCH");
+        for (const auto& f : scratchFields) e->setAttribute(f.name, juce::String(d.*f.member, 15));
+        e->setAttribute("wall0", juce::String(d.wallGain[0], 15));
+        e->setAttribute("wall1", juce::String(d.wallGain[1], 15));
+    }
+    // Where the stylus is, so that a session saved mid-side resumes there.
+    xml->setAttribute(stylusAttribute, juce::String(uiPosition.load(), 9));
+    copyXmlToBinary(*xml, destData);
+}
+
+void DustyTableProcessor::handleAsyncUpdate()
+{
+    // The deck stopped by itself at the end of the side.
+    if (auto* param = apvts.getParameter("arm"); param != nullptr && param->getValue() > 0.5f) {
+        param->beginChangeGesture();
+        param->setValueNotifyingHost(0.0f);
+        param->endChangeGesture();
+    }
 }
 
 void DustyTableProcessor::setStateInformation(const void* data, int sizeInBytes)
 {
     if (auto xml = getXmlFromBinary(data, sizeInBytes))
         if (xml->hasTagName(apvts.state.getType()) || xml->hasTagName("PhysVinyl")) { // also sessions saved under the old name
+            dustytable::ScratchList scratches;
+            if (auto* list = xml->getChildByName(scratchesTag)) {
+                for (auto* e : list->getChildWithTagNameIterator("SCRATCH")) {
+                    dustytable::DrawnScratch d;
+                    for (const auto& f : scratchFields) d.*f.member = e->getDoubleAttribute(f.name, d.*f.member);
+                    d.wallGain[0] = e->getDoubleAttribute("wall0", d.wallGain[0]);
+                    d.wallGain[1] = e->getDoubleAttribute("wall1", d.wallGain[1]);
+                    scratches.add(d);
+                }
+            } else if (xml->getChildByAttribute("id", "scratchCount") != nullptr) {
+                // Saved before scratches were cut by hand: keep the generated layout.
+                scratches = dustytable::legacyScratches(static_cast<int>(savedParam(*xml, "scratchSeed", 1.0)),
+                    static_cast<int>(savedParam(*xml, "disc", 0.0)), savedParam(*xml, "scratchLength", 60.0) * 0.01,
+                    static_cast<int>(savedParam(*xml, "scratchCount", 1.0)));
+            }
+            xml->deleteAllChildElementsWithTagName(scratchesTag);
+            for (const char* id : { "scratchCount", "scratchLength", "scratchSeed", "auto" })
+                if (auto* e = xml->getChildByAttribute("id", id)) xml->removeChildElement(e, true);
+            setScratches(scratches);
+            // Only used if the arm was on the record (see processBlock).
+            savedStylus = xml->getDoubleAttribute(stylusAttribute, -1.0);
+            xml->removeAttribute(stylusAttribute);
+
             auto state = juce::ValueTree::fromXml(*xml);
             if (!state.hasType(apvts.state.getType())) {
                 juce::ValueTree renamed(apvts.state.getType());

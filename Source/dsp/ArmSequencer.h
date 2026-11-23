@@ -235,6 +235,7 @@ public:
     bool isLifterRaised() const { return lifter > 0.0; }
     bool isClamped() const { return clamped; }
     bool isBusy() const { return stepIndex < stepCount; }
+    bool wantsDown() const { return targetDown; }
     const CamMotor& getMotor() const { return motor; }
 
 private:

@@ -22,6 +22,8 @@ constexpr double referenceVelocity = 0.05;    // 5 cm/s at 1 kHz ...
 constexpr double referenceLevel = 0.125;      // ... plays back at -18 dBFS
 constexpr double crosstalk = 0.056;           // -25 dB channel separation
 constexpr double targetInternalRate = 352800.0;
+constexpr double platterSpinUpSeconds = 0.8;   // belt drive, well inside the 1 s START delay
+constexpr double platterSpinDownSeconds = 2.5; // coasting against the brake pad
 constexpr double minDustMicrons = 0.3;
 constexpr double dustSizeExponent = 1.5;      // Pareto: small particles are far more common
 // A static discharge is a short current pulse into the cartridge. It rings the
@@ -108,28 +110,49 @@ void VinylEngine::setArmImmediate(bool down)
     mechanics.reset();
     lastLifter = arm.lifterHeight();
     contactSmoothed = down ? 1.0 : 0.0;
+    platterMotor = down;
+    platterSpeed = down ? 1.0 : 0.0;
+    landed = down;
+    position = std::clamp(params.dropPosition, 0.0, 1.0);
+    endOfSide = endOfSidePending = false;
     settleStylus();
+}
+
+void VinylEngine::setStylusPosition(double p)
+{
+    if (landed) position = std::clamp(p, 0.0, 1.0);
 }
 
 void VinylEngine::setParams(const EngineParams& p)
 {
     params = p;
-    params.scratchCount = std::clamp(params.scratchCount, 0, maxScratches);
     updateStylusConstants();
     arm.setCueSeconds(p.cueSeconds);
-    arm.request(p.armDown);
+    // After stopping at the end of the side the deck waits for Stop before it
+    // will start again.
+    if (!p.armDown) endOfSide = false;
+    arm.request(p.armDown && !endOfSide);
 
-    if (p.scratchSeed != scratchSeedApplied || p.discIndex != scratchDiscApplied
-        || p.scratchLength != scratchLengthApplied || p.scratchDepthMicrons != scratchDepthApplied
-        || p.scratchPileUpMillimetres != scratchPileUpApplied) {
-        scratches = makeScratches(p.scratchSeed, p.discIndex, p.scratchLength, p.scratchDepthMicrons,
-            p.scratchPileUpMillimetres);
-        scratchSeedApplied = p.scratchSeed;
-        scratchDiscApplied = p.discIndex;
-        scratchLengthApplied = p.scratchLength;
-        scratchDepthApplied = p.scratchDepthMicrons;
-        scratchPileUpApplied = p.scratchPileUpMillimetres;
-    }
+    if (p.discIndex != scratchDiscApplied || p.scratchDepthMicrons != scratchDepthApplied
+        || p.scratchPileUpMillimetres != scratchPileUpApplied)
+        rebuildScratches();
+}
+
+void VinylEngine::setScratches(const ScratchList& list)
+{
+    drawnScratches = list;
+    rebuildScratches();
+}
+
+void VinylEngine::rebuildScratches()
+{
+    scratchCount = std::clamp(drawnScratches.count, 0, maxScratches);
+    for (int i = 0; i < scratchCount; ++i)
+        scratches[static_cast<size_t>(i)] = buildScratch(drawnScratches.items[static_cast<size_t>(i)],
+            params.discIndex, params.scratchDepthMicrons, params.scratchPileUpMillimetres);
+    scratchDiscApplied = params.discIndex;
+    scratchDepthApplied = params.scratchDepthMicrons;
+    scratchPileUpApplied = params.scratchPileUpMillimetres;
 }
 
 void VinylEngine::updateStylusConstants()
@@ -301,10 +324,24 @@ void VinylEngine::process(float* left, float* right, float* mechanicsL, float* m
 
     for (int i = 0; i < n; ++i) {
         const double t = tStart + i * dtOut;
-        position = params.autoAdvance ? frac(params.position + t / sideSeconds) : params.position;
+        // Until it lands the stylus is carried to the drop point; after that the
+        // groove pulls it inward (see the end of the loop).
+        if (!landed) position = std::clamp(params.dropPosition, 0.0, 1.0);
         radius = grooveRadius(geom, position);
-        phase = frac(rps * t) * twoPi;
-        const double speed = omega * radius;
+        // At full speed the disc angle follows the transport (so scratches land on
+        // the same beat when a section is replayed); while the platter is slowed
+        // or stopped it turns by its own speed, and the angle it falls behind is
+        // kept as an offset.
+        const double transportPhase = frac(rps * t) * twoPi;
+        if (platterSpeed >= 1.0) {
+            phase = transportPhase + platterOffset;
+            if (platterOffset != 0.0) phase -= twoPi * std::floor(phase / twoPi);
+        } else {
+            phase += omega * platterSpeed * dtOut;
+            phase -= twoPi * std::floor(phase / twoPi);
+            platterOffset = phase - transportPhase;
+        }
+        const double speed = omega * platterSpeed * radius;
         const double step = speed * dtHigh;
 
         const int armEvents = arm.tick();
@@ -314,7 +351,10 @@ void VinylEngine::process(float* left, float* right, float* mechanicsL, float* m
             switch (arm.event(e)) {
             case E::ClampOpen: mechanics.trigger(G::ClampOpen); break;
             case E::ClampClose: mechanics.trigger(G::ClampClose); break;
-            case E::PressStart: mechanics.trigger(G::PressStart); break;
+            case E::PressStart:
+                mechanics.trigger(G::PressStart);
+                platterMotor = true; // START also switches on the platter drive
+                break;
             case E::PressStop: mechanics.trigger(G::PressStop); break;
             case E::SwitchIn: mechanics.trigger(G::SwitchIn); break;
             case E::SwitchOut: mechanics.trigger(G::SwitchOut); break;
@@ -322,6 +362,11 @@ void VinylEngine::process(float* left, float* right, float* mechanicsL, float* m
             case E::None: break;
             }
         }
+        // After STOP the drive switches off once the arm is back on its rest and
+        // the cam has parked; the platter then coasts down against its brake.
+        if (platterMotor && !arm.wantsDown() && arm.overRest() && !arm.getMotor().running()) platterMotor = false;
+        if (platterMotor) platterSpeed = std::min(1.0, platterSpeed + dtOut / platterSpinUpSeconds);
+        else platterSpeed = std::max(0.0, platterSpeed - dtOut / platterSpinDownSeconds);
         mechanics.follow(arm.followerHeight(), arm.camPhase());
         const double lifter = arm.lifterHeight();
         Supports supports { lastLifter, arm.lifterSpeed(), arm.overDisc(), arm.overRest() };
@@ -373,7 +418,7 @@ void VinylEngine::process(float* left, float* right, float* mechanicsL, float* m
 
         Near near[maxScratches];
         int nearCount = 0;
-        for (int k = 0; k < params.scratchCount; ++k) {
+        for (int k = 0; k < scratchCount; ++k) {
             const Scratch& sc = scratches[k];
             if (!sc.covers(radius)) continue;
             const double x = wrapPi(phase - sc.angleAt(radius)) * radius;
@@ -425,6 +470,21 @@ void VinylEngine::process(float* left, float* right, float* mechanicsL, float* m
         const double groove = std::clamp(forces.groove / (2.0 * oversampling * preload), 0.0, 1.0);
         contactSmoothed += contactSmoothing * (groove - contactSmoothed);
         contact[i] = static_cast<float>(contactSmoothed);
+
+        // The groove spirals inward: one side takes sideSeconds at full speed.
+        // At the end of the recorded band the deck returns the arm by itself.
+        if (contactSmoothed > 0.5 && arm.wantsDown()) landed = true;
+        if (arm.overRest()) landed = false;
+        if (landed && contactSmoothed > 0.5) {
+            position += platterSpeed * dtOut / sideSeconds;
+            if (position >= 1.0) {
+                position = 1.0;
+                if (!endOfSide) {
+                    endOfSide = endOfSidePending = true;
+                    arm.request(false);
+                }
+            }
+        }
 
         // 45/45 convention: lateral motion is in phase, vertical motion (both
         // walls pushed out) comes out as L-R.

@@ -1,5 +1,6 @@
 #include "DustyTableEditor.h"
 
+#include <algorithm>
 #include <cmath>
 
 namespace {
@@ -83,23 +84,492 @@ void VinylLookAndFeel::drawRotarySlider(juce::Graphics& g, int x, int y, int wid
 }
 
 //==============================================================================
+namespace {
+
+constexpr int toolSize = 38;
+constexpr double dustPerSecond = 0.2;    // normalised Dust Density per second of pressing (empty to full in 5 s)
+constexpr double eraseClick = 0.05;      // dust wiped by a single eraser click
+constexpr double eraseHoldDelay = 0.3;   // the eraser keeps wiping when held longer than this
+constexpr double maxCutFraction = 2.0 / 3.0; // longest cut, as a fraction of the recorded band
+constexpr double minCutLength = 0.002;   // shortest cut, metres
+constexpr double fullCutSeconds = 2.0;   // holding the nail this long gives the longest cut
+constexpr float eraserReach = 12.0f;     // pixels
+constexpr double eraserLookBack = 0.4;   // s: a scratch that has just turned past the pointer still counts
+
+double wrapPi(double a) { return a - dustytable::twoPi * std::floor((a + dustytable::pi) / dustytable::twoPi); }
+
+double now() { return juce::Time::getMillisecondCounterHiRes() * 0.001; }
+
+juce::String toolTip(DiscTool t)
+{
+    switch (t) {
+    case DiscTool::dust: return "Dust: hold the mouse on the record to add dust";
+    case DiscTool::nail: return "Nail: hold and release on the record to cut a scratch (the longer, the longer the cut)";
+    case DiscTool::eraser: return "Eraser: click the highlighted scratch to remove it, or bare surface to wipe off dust";
+    default: return {};
+    }
+}
+
+} // namespace
+
+ToolButton::ToolButton(DiscTool t)
+    : juce::Button(toolTip(t))
+    , tool(t)
+{
+    setTooltip(toolTip(t));
+}
+
+void ToolButton::paintButton(juce::Graphics& g, bool highlighted, bool down)
+{
+    const auto b = getLocalBounds().toFloat().reduced(1.0f);
+    const bool on = getToggleState();
+    g.setColour(on ? colours::accent.withAlpha(0.28f) : colours::panel.withAlpha(highlighted ? 0.95f : 0.8f));
+    g.fillRoundedRectangle(b, 6.0f);
+    g.setColour(on ? colours::accent : colours::dim.withAlpha(highlighted ? 0.8f : 0.45f));
+    g.drawRoundedRectangle(b, 6.0f, on ? 1.6f : 1.0f);
+    DiscView::drawToolIcon(g, tool, b.reduced(down ? 5.0f : 4.0f));
+}
+
+// Icons are drawn on a 32 x 32 grid; the cursors use them at that size.
+void DiscView::drawToolIcon(juce::Graphics& g, DiscTool t, juce::Rectangle<float> area)
+{
+    const float s = juce::jmin(area.getWidth(), area.getHeight()) / 32.0f;
+    const auto o = area.getCentre() - juce::Point<float> { 16.0f, 16.0f } * s;
+    auto P = [&](float x, float y) { return o + juce::Point<float> { x, y } * s; };
+    const juce::Colour outline = juce::Colours::black.withAlpha(0.8f);
+
+    if (t == DiscTool::dust) {
+        struct Speck {
+            float x, y, r;
+        };
+        const Speck specks[] = { { 16, 16, 5.0f }, { 9.5f, 11.5f, 3.0f }, { 21.5f, 9.5f, 3.2f }, { 22, 21, 3.6f },
+            { 10.5f, 21.5f, 2.8f }, { 16, 26, 2.0f }, { 6.5f, 16, 1.6f }, { 26, 14.5f, 1.6f }, { 17.5f, 5.5f, 1.5f } };
+        for (const auto& k : specks) {
+            const auto p = P(k.x, k.y);
+            const float r = (k.r + 1.2f) * s;
+            g.setColour(outline);
+            g.fillEllipse(p.x - r, p.y - r, 2 * r, 2 * r);
+        }
+        for (const auto& k : specks) {
+            const auto p = P(k.x, k.y);
+            g.setColour(juce::Colour(0xffb9b2a6).withAlpha(0.45f));
+            const float halo = (k.r + 0.6f) * s;
+            g.fillEllipse(p.x - halo, p.y - halo, 2 * halo, 2 * halo);
+            g.setColour(juce::Colour(0xffd8d1c4));
+            const float r = k.r * 0.8f * s;
+            g.fillEllipse(p.x - r, p.y - r, 2 * r, 2 * r);
+        }
+        // A fibre.
+        juce::Path fibre;
+        fibre.startNewSubPath(P(4, 26));
+        fibre.cubicTo(P(8, 22), P(9, 29), P(14, 27));
+        g.setColour(outline);
+        g.strokePath(fibre, juce::PathStrokeType(2.6f * s));
+        g.setColour(juce::Colour(0xffd8d1c4));
+        g.strokePath(fibre, juce::PathStrokeType(1.0f * s));
+    } else if (t == DiscTool::nail) {
+        // Point at the bottom left, head at the top right.
+        juce::Path shank;
+        shank.startNewSubPath(P(24.5f, 7.5f));
+        shank.lineTo(P(6.5f, 25.5f));
+        juce::Path tip;
+        tip.startNewSubPath(P(8.3f, 26.3f));
+        tip.lineTo(P(2.0f, 30.0f));
+        tip.lineTo(P(5.7f, 23.7f));
+        tip.closeSubPath();
+        g.setColour(outline);
+        g.strokePath(shank, juce::PathStrokeType(5.4f * s, juce::PathStrokeType::mitered, juce::PathStrokeType::butt));
+        g.strokePath(tip, juce::PathStrokeType(2.2f * s));
+        g.drawLine({ P(21.0f, 4.0f), P(28.0f, 11.0f) }, 6.6f * s);
+        g.setColour(juce::Colour(0xffb5bac2));
+        g.strokePath(shank, juce::PathStrokeType(3.0f * s, juce::PathStrokeType::mitered, juce::PathStrokeType::butt));
+        g.fillPath(tip);
+        g.setColour(juce::Colour(0xffe4e7ec));
+        g.drawLine({ P(23.0f, 7.5f), P(8.0f, 22.5f) }, 0.9f * s);
+        g.setColour(juce::Colour(0xffa2a7b0));
+        g.drawLine({ P(21.5f, 4.5f), P(27.5f, 10.5f) }, 4.0f * s);
+    } else if (t == DiscTool::eraser) {
+        // Rubber at the bottom left, sleeve above it.
+        const auto a = P(3.0f, 24.0f), b = P(8.0f, 29.0f);
+        const juce::Point<float> u { 15.6f * s, -15.6f * s };
+        auto quad = [](juce::Point<float> p0, juce::Point<float> p1, juce::Point<float> p2, juce::Point<float> p3) {
+            juce::Path p;
+            p.startNewSubPath(p0);
+            p.lineTo(p1);
+            p.lineTo(p2);
+            p.lineTo(p3);
+            p.closeSubPath();
+            return p;
+        };
+        const auto body = quad(a, b, b + u, a + u);
+        const auto rubber = quad(a, b, b + u * 0.42f, a + u * 0.42f);
+        g.setColour(outline);
+        g.strokePath(body, juce::PathStrokeType(2.4f * s, juce::PathStrokeType::curved));
+        g.setColour(juce::Colour(0xff5b8dd6));
+        g.fillPath(body);
+        g.setColour(juce::Colour(0xffe9a0ae));
+        g.fillPath(rubber);
+        g.setColour(juce::Colours::white.withAlpha(0.35f));
+        g.drawLine({ a + u * 0.45f + (b - a) * 0.2f, a + u * 0.95f + (b - a) * 0.2f }, 1.0f * s);
+    }
+}
+
+DiscView::DiscView(DustyTableProcessor& p)
+    : processor(p)
+{
+    for (auto t : { DiscTool::dust, DiscTool::nail, DiscTool::eraser }) {
+        auto b = std::make_unique<ToolButton>(t);
+        b->setClickingTogglesState(false);
+        b->onClick = [this, t] { setTool(t); };
+        addAndMakeVisible(*b);
+        toolButtons.push_back(std::move(b));
+    }
+    struct Hot {
+        DiscTool tool;
+        int x, y;
+    };
+    for (const auto& h : { Hot { DiscTool::dust, 16, 16 }, Hot { DiscTool::nail, 2, 30 }, Hot { DiscTool::eraser, 5, 27 } }) {
+        juce::Image image(juce::Image::ARGB, 32, 32, true);
+        {
+            juce::Graphics g(image);
+            drawToolIcon(g, h.tool, { 0.0f, 0.0f, 32.0f, 32.0f });
+        }
+        cursors[static_cast<size_t>(h.tool)] = juce::MouseCursor(image, h.x, h.y);
+    }
+}
+
+void DiscView::resized()
+{
+    int y = 12;
+    for (auto& b : toolButtons) {
+        b->setBounds(12, y, toolSize, toolSize);
+        y += toolSize + 6;
+    }
+}
+
+void DiscView::setTool(DiscTool t)
+{
+    if (pressing) return;
+    tool = tool == t ? DiscTool::none : t;
+    for (auto& b : toolButtons) b->setToggleState(b->tool == tool, juce::dontSendNotification);
+    setMouseCursor(cursors[static_cast<size_t>(tool)]);
+}
+
+DiscView::Layout DiscView::layout() const
+{
+    auto& ap = processor.apvts;
+    Layout l {};
+    l.discIndex = static_cast<int>(ap.getRawParameterValue("disc")->load());
+    l.geom = dustytable::discGeometry(l.discIndex);
+    l.phase = framePhase;
+    l.radius = processor.uiRadius.load();
+
+    const auto area = getLocalBounds().toFloat();
+    l.c = { area.getCentreX() - 20.0f, area.getCentreY() + 10.0f };
+    l.platterR = juce::jmin(area.getWidth(), area.getHeight()) * 0.42f;
+    // Smaller discs are drawn to scale on the same 12" platter.
+    l.scale = l.platterR / 0.151f;
+    l.discR = static_cast<float>(l.geom.discRadius) * l.scale;
+
+    // Tonearm: pivot outside the disc, stylus on the current groove radius.
+    l.pivot = { l.c.x + l.platterR * 1.05f, l.c.y - l.platterR * 0.85f };
+    l.armLength = l.platterR * 1.25f;
+    const float rPx = static_cast<float>(l.radius) * l.scale;
+    const auto toPivot = l.pivot - l.c;
+    const float d = toPivot.getDistanceFromOrigin();
+    const float a = (rPx * rPx - l.armLength * l.armLength + d * d) / (2.0f * d);
+    const float h = std::sqrt(juce::jmax(0.0f, rPx * rPx - a * a));
+    const auto basePt = l.c + toPivot * (a / d);
+    const juce::Point<float> perp { -toPivot.y / d, toPivot.x / d };
+    const auto p1 = basePt + perp * h, p2 = basePt - perp * h;
+    l.stylusPt = p1.y > p2.y ? p1 : p2;
+    l.stylusAngle = std::atan2(l.stylusPt.y - l.c.y, l.stylusPt.x - l.c.x);
+    return l;
+}
+
+// A point at disc angle theta is under the stylus when phase == theta; the disc
+// turns clockwise.
+float DiscView::screenAngle(const Layout& l, double theta) { return l.stylusAngle + static_cast<float>(l.phase - theta); }
+
+double DiscView::discAngle(const Layout& l, float angle)
+{
+    const double theta = l.stylusAngle + l.phase - angle;
+    return theta - dustytable::twoPi * std::floor(theta / dustytable::twoPi);
+}
+
+bool DiscView::onDisc(juce::Point<float> pos, const Layout& l) const { return pos.getDistanceFrom(l.c) <= l.discR; }
+
+bool DiscView::onGrooves(juce::Point<float> pos, const Layout& l) const
+{
+    const float d = pos.getDistanceFrom(l.c);
+    return d <= l.discR && d >= static_cast<float>(l.geom.labelRadius) * l.scale;
+}
+
+juce::Path DiscView::scratchPath(const dustytable::Scratch& s, const Layout& l) const
+{
+    juce::Path p;
+    const int steps = 24;
+    for (int k = 0; k <= steps; ++k) {
+        const double r = s.rStart + (s.rEnd - s.rStart) * k / steps;
+        const auto pt = polar(l.c, static_cast<float>(r) * l.scale, screenAngle(l, s.angleAt(r)));
+        if (k == 0) p.startNewSubPath(pt);
+        else p.lineTo(pt);
+    }
+    return p;
+}
+
+int DiscView::eraserTarget(juce::Point<float> pos, const Layout& l) const
+{
+    const double t = now();
+    const double r = pos.getDistanceFrom(l.c) / l.scale;
+    const double pointerAngle = std::atan2(pos.y - l.c.y, pos.x - l.c.x);
+    const double reach = eraserReach / l.scale; // metres
+
+    // Disc angles under the pointer over the look-back, oldest first.
+    std::vector<PhaseSample> samples;
+    for (size_t k = 0; k < phaseHistory.size(); ++k) {
+        const auto& s = phaseHistory[(static_cast<size_t>(phaseHistoryNext) + k) % phaseHistory.size()];
+        if (s.time >= t - eraserLookBack) samples.push_back(s);
+    }
+    samples.push_back({ t, l.phase });
+
+    const auto list = processor.getScratches();
+    int best = -1;
+    double bestTime = -1.0e9, bestDistance = 1.0e9;
+    for (int i = 0; i < list.count; ++i) {
+        const auto s = dustytable::buildScratch(list.items[static_cast<size_t>(i)], l.discIndex, 10.0, 1.0);
+        if (r < s.rStart - reach || r > s.rEnd + reach) continue;
+        const double rc = juce::jlimit(s.rStart, s.rEnd, r);
+        const double radial = std::abs(r - rc);
+        const double scratchAngle = s.angleAt(rc);
+        auto offset = [&](double phase) { return wrapPi(scratchAngle - (l.stylusAngle + phase - pointerAngle)); };
+        // Latest moment the scratch was within reach of the pointer, also
+        // counting a pass between two frames.
+        double hitTime = -1.0e9, hitDistance = 1.0e9;
+        for (size_t k = 0; k < samples.size(); ++k) {
+            const double a = offset(samples[k].phase);
+            double arc = std::abs(a) * rc;
+            if (k > 0) {
+                const double b = offset(samples[k - 1].phase);
+                if ((a < 0.0) != (b < 0.0) && std::abs(a) + std::abs(b) < dustytable::pi) arc = 0.0;
+            }
+            const double d = std::sqrt(arc * arc + radial * radial);
+            if (d <= reach && samples[k].time >= hitTime) {
+                hitTime = samples[k].time;
+                hitDistance = d;
+            }
+        }
+        if (hitTime > bestTime + 1e-9 || (std::abs(hitTime - bestTime) <= 1e-9 && hitDistance < bestDistance)) {
+            if (hitTime < -1.0e8) continue;
+            best = i;
+            bestTime = hitTime;
+            bestDistance = hitDistance;
+        }
+    }
+    return best;
+}
+
+dustytable::DrawnScratch DiscView::nailCut(const Layout& l, juce::Point<float> pos, double heldSeconds) const
+{
+    const double band = l.geom.outerGroove - l.geom.innerGroove;
+    const double shortest = std::min(maxCutFraction, minCutLength / band);
+    const double fraction = shortest + (maxCutFraction - shortest) * juce::jlimit(0.0, 1.0, heldSeconds / fullCutSeconds);
+    const double r = pos.getDistanceFrom(l.c) / l.scale;
+    const double theta = discAngle(l, std::atan2(pos.y - l.c.y, pos.x - l.c.x));
+    return dustytable::cutScratch(l.discIndex, r, theta, fraction, cutSeed);
+}
+
+void DiscView::beginDustGesture()
+{
+    if (dustGesture) return;
+    if (auto* param = processor.apvts.getParameter("dustDensity")) {
+        param->beginChangeGesture();
+        dustValue = param->getValue();
+        dustGesture = true;
+    }
+}
+
+void DiscView::endDustGesture()
+{
+    if (!dustGesture) return;
+    if (auto* param = processor.apvts.getParameter("dustDensity")) param->endChangeGesture();
+    dustGesture = false;
+}
+
+void DiscView::changeDust(double delta)
+{
+    auto* param = processor.apvts.getParameter("dustDensity");
+    if (param == nullptr || !dustGesture) return;
+    // Accumulate here: the parameter snaps to its step, which would swallow
+    // the small per-frame increments near zero.
+    dustValue = juce::jlimit(0.0, 1.0, dustValue + delta);
+    if (std::abs(param->getValue() - static_cast<float>(dustValue)) > 1e-6f)
+        param->setValueNotifyingHost(static_cast<float>(dustValue));
+}
+
+void DiscView::mouseDown(const juce::MouseEvent& e)
+{
+    if (tool == DiscTool::none) return;
+    const auto l = layout();
+    pressPos = e.position;
+    pressStart = lastTick = now();
+    pressing = false;
+    switch (tool) {
+    case DiscTool::dust:
+        if (onDisc(pressPos, l)) {
+            pressing = true;
+            beginDustGesture();
+        }
+        break;
+    case DiscTool::nail:
+        if (onGrooves(pressPos, l)) {
+            pressing = true;
+            cutSeed = static_cast<uint64_t>(juce::Random::getSystemRandom().nextInt64());
+        }
+        break;
+    case DiscTool::eraser:
+        if (const int index = eraserTarget(pressPos, l); index >= 0) {
+            auto list = processor.getScratches();
+            list.remove(index);
+            processor.setScratches(list);
+        } else if (onDisc(pressPos, l)) {
+            pressing = true;
+            beginDustGesture();
+            changeDust(-eraseClick);
+        }
+        break;
+    default: break;
+    }
+}
+
+void DiscView::mouseDrag(const juce::MouseEvent& e)
+{
+    pressPos = hoverPos = e.position;
+    hovering = true;
+}
+
+void DiscView::mouseMove(const juce::MouseEvent& e)
+{
+    hoverPos = e.position;
+    hovering = true;
+}
+
+void DiscView::mouseExit(const juce::MouseEvent&) { hovering = false; }
+
+void DiscView::mouseUp(const juce::MouseEvent& e)
+{
+    pressPos = e.position;
+    if (pressing && tool == DiscTool::nail) {
+        const auto l = layout();
+        // Released off the record: no cut.
+        if (onGrooves(pressPos, l)) {
+            auto list = processor.getScratches();
+            list.add(nailCut(l, pressPos, now() - pressStart));
+            processor.setScratches(list);
+        }
+    }
+    endDustGesture();
+    pressing = false;
+}
+
+void DiscView::tick()
+{
+    const double t = now();
+    const double dt = juce::jlimit(0.0, 0.1, t - lastTick);
+    lastTick = t;
+
+    // The audio thread reports the angle once per block; carry it on to this
+    // frame so that the disc turns smoothly and the tools hit what is drawn.
+    const int rpmIndex = static_cast<int>(processor.apvts.getRawParameterValue("rpm")->load());
+    const double omega = dustytable::twoPi * dustytable::rpmValue(rpmIndex) / 60.0;
+    const double age = juce::jlimit(0.0, 0.1, t - processor.uiPhaseStamp.load() * 0.001);
+    framePhase = processor.uiPhase.load() + omega * processor.uiPlatterSpeed.load() * age;
+    framePhase -= dustytable::twoPi * std::floor(framePhase / dustytable::twoPi);
+    phaseHistory[static_cast<size_t>(phaseHistoryNext)] = { t, framePhase };
+    phaseHistoryNext = (phaseHistoryNext + 1) % static_cast<int>(phaseHistory.size());
+
+    if (!pressing) return;
+    const auto l = layout();
+    if (!onDisc(pressPos, l)) return;
+    if (tool == DiscTool::dust) changeDust(dustPerSecond * dt);
+    else if (tool == DiscTool::eraser && t - pressStart > eraseHoldDelay) changeDust(-dustPerSecond * dt);
+}
+
+// Dust settles over the whole surface, a little unevenly: a fixed mottled
+// pattern that fills in as the amount grows.
+void DiscView::paintDust(juce::Graphics& g, const Layout& l)
+{
+    const float density = processor.apvts.getRawParameterValue("dustDensity")->load();
+    const float level = std::pow(juce::jlimit(0.0f, 1.0f, density / 60.0f), 0.8f);
+    if (level < 0.002f) return;
+    const int n = dustImageSize;
+
+    if (mottle.empty()) {
+        // Value noise over a few octaves, normalised to 0..1.
+        mottle.assign(static_cast<size_t>(n * n), 0.0f);
+        dustytable::Rng rng(20261123);
+        const int cellsPerOctave[] = { 4, 9, 19, 40, 85 };
+        const float weights[] = { 1.0f, 0.7f, 0.45f, 0.3f, 0.22f };
+        for (int o = 0; o < 5; ++o) {
+            const int cells = cellsPerOctave[o];
+            std::vector<float> grid(static_cast<size_t>((cells + 1) * (cells + 1)));
+            for (auto& v : grid) v = static_cast<float>(rng.uniform());
+            for (int y = 0; y < n; ++y)
+                for (int x = 0; x < n; ++x) {
+                    const float fx = x * static_cast<float>(cells) / n, fy = y * static_cast<float>(cells) / n;
+                    const int ix = static_cast<int>(fx), iy = static_cast<int>(fy);
+                    float tx = fx - ix, ty = fy - iy;
+                    tx = tx * tx * (3.0f - 2.0f * tx);
+                    ty = ty * ty * (3.0f - 2.0f * ty);
+                    auto at = [&](int gx, int gy) { return grid[static_cast<size_t>(gy * (cells + 1) + gx)]; };
+                    const float v = (at(ix, iy) * (1 - tx) + at(ix + 1, iy) * tx) * (1 - ty)
+                                    + (at(ix, iy + 1) * (1 - tx) + at(ix + 1, iy + 1) * tx) * ty;
+                    mottle[static_cast<size_t>(y * n + x)] += weights[o] * v;
+                }
+        }
+        const auto [lo, hi] = std::minmax_element(mottle.begin(), mottle.end());
+        const float mn = *lo, range = juce::jmax(1e-6f, *hi - *lo);
+        for (auto& v : mottle) v = (v - mn) / range;
+        dustImage = juce::Image(juce::Image::ARGB, n, n, true);
+    }
+
+    if (std::abs(level - dustImageLevel) > 0.004f) {
+        dustImageLevel = level;
+        juce::Image::BitmapData data(dustImage, juce::Image::BitmapData::writeOnly);
+        const juce::Colour grey(0xffaaa59c);
+        for (int y = 0; y < n; ++y)
+            for (int x = 0; x < n; ++x) {
+                const float dx = (x + 0.5f) / n * 2.0f - 1.0f, dy = (y + 0.5f) / n * 2.0f - 1.0f;
+                const float rr = std::sqrt(dx * dx + dy * dy);
+                const float m = mottle[static_cast<size_t>(y * n + x)];
+                // Never saturates, so the patches stay visible even when the disc is full.
+                float a = 0.8f * level * (0.3f + 0.7f * m * m * (3.0f - 2.0f * m));
+                a *= juce::jlimit(0.0f, 1.0f, (1.0f - rr) * 60.0f);
+                data.setPixelColour(x, y, grey.withAlpha(a));
+            }
+    }
+
+    juce::Graphics::ScopedSaveState state(g);
+    g.setImageResamplingQuality(juce::Graphics::mediumResamplingQuality);
+    g.drawImageTransformed(dustImage,
+        juce::AffineTransform::translation(-0.5f * n, -0.5f * n)
+            .scaled(2.0f * l.discR / n)
+            .rotated(static_cast<float>(l.phase))
+            .translated(l.c));
+}
+
 void DiscView::paint(juce::Graphics& g)
 {
     using dustytable::twoPi;
     auto& ap = processor.apvts;
-    const int discIndex = static_cast<int>(ap.getRawParameterValue("disc")->load());
+    const auto L = layout();
     const int rpmIndex = static_cast<int>(ap.getRawParameterValue("rpm")->load());
-    const auto geom = dustytable::discGeometry(discIndex);
-    const double phase = processor.uiPhase.load();
-    const double radius = processor.uiRadius.load();
+    const auto& geom = L.geom;
+    const double phase = L.phase;
+    const double radius = L.radius;
     const double position = processor.uiPosition.load();
-
-    const auto area = getLocalBounds().toFloat();
-    const juce::Point<float> c { area.getCentreX() - 20.0f, area.getCentreY() + 10.0f };
-    const float platterR = juce::jmin(area.getWidth(), area.getHeight()) * 0.42f;
-    // Smaller discs are drawn to scale on the same 12" platter.
-    const float scale = platterR / 0.151f;
-    const float discR = static_cast<float>(geom.discRadius) * scale;
+    const auto c = L.c;
+    const float platterR = L.platterR, scale = L.scale, discR = L.discR;
 
     // Platter and its mat.
     g.setColour(juce::Colour(0xff2a272d));
@@ -110,6 +580,7 @@ void DiscView::paint(juce::Graphics& g)
     // Disc and grooves.
     g.setColour(colours::vinyl);
     g.fillEllipse(c.x - discR, c.y - discR, discR * 2, discR * 2);
+    paintDust(g, L);
     const float outer = static_cast<float>(geom.outerGroove) * scale;
     const float inner = static_cast<float>(geom.innerGroove) * scale;
     g.setColour(juce::Colours::white.withAlpha(0.045f));
@@ -129,42 +600,37 @@ void DiscView::paint(juce::Graphics& g)
         g.fillPath(wedge);
     }
 
-    // Tonearm: pivot outside the disc, stylus on the current groove radius.
-    const juce::Point<float> pivot { c.x + platterR * 1.05f, c.y - platterR * 0.85f };
-    const float armLength = platterR * 1.25f;
-    const float rPx = static_cast<float>(radius) * scale;
-    const auto toPivot = pivot - c;
-    const float d = toPivot.getDistanceFromOrigin();
-    const float a = (rPx * rPx - armLength * armLength + d * d) / (2.0f * d);
-    const float h = std::sqrt(juce::jmax(0.0f, rPx * rPx - a * a));
-    const auto basePt = c + toPivot * (a / d);
-    const juce::Point<float> perp { -toPivot.y / d, toPivot.x / d };
-    const auto p1 = basePt + perp * h, p2 = basePt - perp * h;
-    const auto stylusPt = p1.y > p2.y ? p1 : p2;
-    const float stylusAngle = std::atan2(stylusPt.y - c.y, stylusPt.x - c.x);
-
-    // A point at disc angle theta is under the stylus when phase == theta; the
-    // disc turns clockwise.
-    auto screenAngle = [&](double theta) { return stylusAngle + static_cast<float>(phase - theta); };
+    const auto pivot = L.pivot;
+    const float armLength = L.armLength;
+    const auto stylusPt = L.stylusPt;
 
     // Scratches.
-    const int count = static_cast<int>(ap.getRawParameterValue("scratchCount")->load());
-    const auto scratches = dustytable::makeScratches(static_cast<int>(ap.getRawParameterValue("scratchSeed")->load()),
-        discIndex, ap.getRawParameterValue("scratchLength")->load() * 0.01,
-        ap.getRawParameterValue("scratchDepth")->load(), ap.getRawParameterValue("scratchPileUp")->load());
-    for (int i = 0; i < count; ++i) {
-        const auto& s = scratches[static_cast<size_t>(i)];
-        juce::Path p;
-        const int steps = 12;
-        for (int k = 0; k <= steps; ++k) {
-            const double r = s.rStart + (s.rEnd - s.rStart) * k / steps;
-            const auto pt = polar(c, static_cast<float>(r) * scale, screenAngle(s.angleAt(r)));
-            if (k == 0) p.startNewSubPath(pt);
-            else p.lineTo(pt);
-        }
+    const double depth = ap.getRawParameterValue("scratchDepth")->load();
+    const double pileUp = ap.getRawParameterValue("scratchPileUp")->load();
+    const auto list = processor.getScratches();
+    // The scratch a click of the eraser would remove.
+    const int target = tool == DiscTool::eraser && hovering && !pressing ? eraserTarget(hoverPos, L) : -1;
+    for (int i = 0; i < list.count; ++i) {
+        const auto s = dustytable::buildScratch(list.items[static_cast<size_t>(i)], L.discIndex, depth, pileUp);
         const bool active = s.covers(radius);
-        g.setColour(juce::Colours::white.withAlpha(active ? 0.55f : 0.25f));
-        g.strokePath(p, juce::PathStrokeType(static_cast<float>(0.8 + s.width * 1e4)));
+        const auto path = scratchPath(s, L);
+        const float w = static_cast<float>(0.8 + s.width * 1e4);
+        // A dark edge keeps the cut visible on a dusty, grey surface.
+        g.setColour(juce::Colours::black.withAlpha(0.45f));
+        g.strokePath(path, juce::PathStrokeType(w + 1.6f));
+        if (i == target) {
+            g.setColour(colours::accent);
+            g.strokePath(path, juce::PathStrokeType(w + 1.5f));
+        } else {
+            g.setColour(juce::Colours::white.withAlpha(active ? 0.6f : 0.32f));
+            g.strokePath(path, juce::PathStrokeType(w));
+        }
+    }
+    // The cut the nail would make if released now.
+    if (pressing && tool == DiscTool::nail && onGrooves(pressPos, L)) {
+        const auto s = dustytable::buildScratch(nailCut(L, pressPos, now() - pressStart), L.discIndex, depth, pileUp);
+        g.setColour(colours::accent.withAlpha(0.85f));
+        g.strokePath(scratchPath(s, L), juce::PathStrokeType(static_cast<float>(0.8 + s.width * 1e4)));
     }
 
     // Label, turning with the disc.
@@ -256,16 +722,28 @@ void DiscView::paint(juce::Graphics& g)
 
     // Readout of the physical state.
     const double rpm = dustytable::rpmValue(rpmIndex);
-    const double speed = twoPi * rpm / 60.0 * radius;
+    const double speed = twoPi * rpm / 60.0 * radius * processor.uiPlatterSpeed.load();
     const float side = ap.getRawParameterValue("side")->load();
     const int elapsed = static_cast<int>(position * side * 60.0);
-    g.setColour(colours::dim);
     g.setFont(juce::FontOptions(13.0f));
+    auto infoArea = getLocalBounds().removeFromBottom(28).reduced(16, 0);
+    // Current stylus position, on the same scale as the Drop point knob.
+    {
+        const juce::String label = "Stylus ";
+        const juce::String value = juce::String(position * 100.0, 2) + " %";
+        g.setColour(colours::dim);
+        g.drawText(label, infoArea, juce::Justification::centredLeft);
+        infoArea.removeFromLeft(juce::roundToInt(juce::GlyphArrangement::getStringWidth(g.getCurrentFont(), label)));
+        g.setColour(colours::text);
+        g.drawText(value, infoArea, juce::Justification::centredLeft);
+        infoArea.removeFromLeft(juce::roundToInt(juce::GlyphArrangement::getStringWidth(g.getCurrentFont(), "100.00 %")) + 14);
+    }
+    g.setColour(colours::dim);
     const juce::String info = juce::String(radius * 1000.0, 1) + " mm   "
                               + juce::String(speed * 100.0, 1) + " cm/s   "
                               + juce::String(elapsed / 60) + ":" + juce::String(elapsed % 60).paddedLeft('0', 2)
                               + " / " + juce::String(side, 1) + " min";
-    g.drawText(info, getLocalBounds().removeFromBottom(28).reduced(16, 0), juce::Justification::centredLeft);
+    g.drawText(info, infoArea, juce::Justification::centredLeft);
 }
 
 //==============================================================================
@@ -282,10 +760,10 @@ DustyTableEditor::DustyTableEditor(DustyTableProcessor& p)
         for (const auto& [id, text] : items) s.knobs.push_back(addKnob(id, text));
         sections.push_back(std::move(s));
     };
-    section("DECK", { { "vtf", "Tracking" }, { "position", "Position" }, { "side", "Side" }, { "cue", "Cue damping" } });
-    section("SCRATCH", { { "scratchCount", "Count" }, { "scratchDepth", "Depth" }, { "scratchPileUp", "Pile-up" },
-                           { "scratchLength", "Length" }, { "scratchSeed", "Layout" } });
-    section("DUST", { { "dustDensity", "Density" }, { "dustSize", "Max size" } });
+    section("DECK", { { "vtf", "Tracking" }, { "position", "Drop point" }, { "side", "Side" }, { "cue", "Cue damping" } });
+    // Scratches are cut and dust is spread with the tools on the record.
+    section("SCRATCH", { { "scratchDepth", "Depth" }, { "scratchPileUp", "Pile-up" } });
+    section("DUST", { { "dustSize", "Max size" } });
     section("STATIC ELECTRICITY", { { "static", "Charge" } });
     section("OUTPUT", { { "noise", "Noise" }, { "mech", "Mechanics" }, { "dry", "Dry" } });
 
@@ -302,7 +780,6 @@ DustyTableEditor::DustyTableEditor(DustyTableProcessor& p)
     stylusBox.addItemList({ "Conical", "Elliptical" }, 1);
     addAndMakeVisible(discBox);
     addAndMakeVisible(stylusBox);
-    addAndMakeVisible(autoButton);
     // Deck buttons: START lowers the arm onto the record, STOP returns it.
     startButton.onClick = [this] { setArm(true); };
     stopButton.onClick = [this] { setArm(false); };
@@ -312,7 +789,6 @@ DustyTableEditor::DustyTableEditor(DustyTableProcessor& p)
     addAndMakeVisible(stopButton);
     discAttachment = std::make_unique<juce::AudioProcessorValueTreeState::ComboBoxAttachment>(p.apvts, "disc", discBox);
     stylusAttachment = std::make_unique<juce::AudioProcessorValueTreeState::ComboBoxAttachment>(p.apvts, "stylus", stylusBox);
-    autoAttachment = std::make_unique<juce::AudioProcessorValueTreeState::ButtonAttachment>(p.apvts, "auto", autoButton);
 
     setSize(discWidth + panelWidth, editorHeight);
     timerCallback();
@@ -365,6 +841,7 @@ void DustyTableEditor::timerCallback()
     const bool armDown = processor.apvts.getRawParameterValue("arm")->load() > 0.5f;
     startButton.setToggleState(armDown, juce::dontSendNotification);
     stopButton.setToggleState(!armDown, juce::dontSendNotification);
+    disc.tick();
     disc.repaint();
 }
 
@@ -410,18 +887,27 @@ void DustyTableEditor::resized()
     discBox.setBounds(selectors.removeFromLeft(70));
     selectors.removeFromLeft(8);
     stylusBox.setBounds(selectors.removeFromLeft(104));
-    selectors.removeFromLeft(8);
-    autoButton.setBounds(selectors);
     panel.removeFromTop(12);
 
-    // Rows: DECK | SCRATCH | DUST + STATIC ELECTRICITY | OUTPUT. Cells shrink when
+    // Rows: DECK | SCRATCH + DUST + STATIC ELECTRICITY | OUTPUT. Cells shrink when
     // a row holds more knobs than fit; the last section takes the rest of the row.
-    const std::vector<std::vector<size_t>> rows { { 0 }, { 1 }, { 2, 3 }, { 4 } };
+    const std::vector<std::vector<size_t>> rows { { 0 }, { 1, 2, 3 }, { 4 } };
     for (const auto& row : rows) {
         auto rowArea = panel.removeFromTop(rowHeight);
         size_t knobsInRow = 0;
         for (size_t index : row) knobsInRow += sections[index].knobs.size();
-        const int cell = juce::jmin(cellWidth, rowArea.getWidth() / static_cast<int>(knobsInRow));
+        int cell = juce::jmin(cellWidth, rowArea.getWidth() / static_cast<int>(knobsInRow));
+        // Leave the last section room for its whole title.
+        const auto& last = sections[row.back()];
+        const int lastKnobs = static_cast<int>(last.knobs.size());
+        if (static_cast<int>(knobsInRow) > lastKnobs) {
+            const int titleWidth = juce::roundToInt(juce::GlyphArrangement::getStringWidth(
+                                       juce::FontOptions(11.0f, juce::Font::bold), last.title))
+                                   + 16;
+            const int room = (rowArea.getWidth() - juce::jmax(titleWidth, cell * lastKnobs))
+                             / (static_cast<int>(knobsInRow) - lastKnobs);
+            cell = juce::jmin(cell, room);
+        }
         for (size_t index : row) {
             auto& s = sections[index];
             auto bounds = index == row.back() ? rowArea

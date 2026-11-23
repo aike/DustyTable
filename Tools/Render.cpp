@@ -71,16 +71,19 @@ void printBands(const char* label, const std::vector<float>& x, int rate, double
     std::printf("\n");
 }
 
-void render(const std::string& dir, const char* name, EngineParams p, double seconds, int rate = 48000,
+void render(const std::string& dir, const char* name, EngineParams p, const dustytable::ScratchList& scratches, double seconds, int rate = 48000,
     const Automation& automate = {})
 {
     VinylEngine engine;
     engine.prepare(rate);
     engine.setParams(p);
+    engine.setScratches(scratches);
     engine.setArmImmediate(p.armDown);
     const int n = static_cast<int>(seconds * rate);
     std::vector<float> l(n), r(n), ml(n), mr(n), contact(n);
     const int block = 512;
+    std::string platterLog;
+    double platterBefore = engine.getPlatterSpeed();
     for (int i = 0; i < n; i += block) {
         const int m = std::min(block, n - i);
         const double t = static_cast<double>(i) / rate;
@@ -89,6 +92,13 @@ void render(const std::string& dir, const char* name, EngineParams p, double sec
             engine.setParams(p);
         }
         engine.process(l.data() + i, r.data() + i, ml.data() + i, mr.data() + i, contact.data() + i, m, t);
+        const double platter = engine.getPlatterSpeed();
+        if ((platter >= 1.0) != (platterBefore >= 1.0) || (platter <= 0.0) != (platterBefore <= 0.0)) {
+            char text[48];
+            std::snprintf(text, sizeof text, " %.2fs:%s", t, platter >= 1.0 ? "full" : platter <= 0.0 ? "stopped" : (platter > platterBefore ? "starting" : "stopping"));
+            platterLog += text;
+        }
+        platterBefore = platter;
     }
     if (automate) {
         printTimeline("cartridge", l, r, rate, -50.0);
@@ -99,6 +109,7 @@ void render(const std::string& dir, const char* name, EngineParams p, double sec
             if ((contact[i] > 0.5f) != (contact[i - 1] > 0.5f))
                 std::printf(" %.2fs:%s", static_cast<double>(i) / rate, contact[i] > 0.5f ? "on" : "off");
         std::printf("\n");
+        std::printf("    platter   %s   (stylus at the end: %.4f)\n", platterLog.c_str(), engine.getPosition());
         writeWav(dir + "/" + name + "_mechanics.wav", ml, mr, rate);
         if (std::string(name) == "arm_down") {
             printBands("clamp", ml, rate, 0.5, 0.7);
@@ -152,7 +163,6 @@ EngineParams silent()
 {
     EngineParams p;
     p.dustPerMetre = 0.0;
-    p.scratchCount = 0;
     p.staticAmount = 0.0;
     return p;
 }
@@ -164,53 +174,70 @@ int main(int argc, char** argv)
     const std::string dir = argc > 1 ? argv[1] : ".";
     const double seconds = argc > 2 ? std::atof(argv[2]) : 8.0;
 
+    using dustytable::legacyScratches;
+    dustytable::ScratchList sc;
     EngineParams p = silent();
-    render(dir, "silence", p, 2.0);
+    render(dir, "silence", p, sc, 2.0);
 
     p = silent(); p.dustPerMetre = 3.0;
-    render(dir, "dust_33", p, seconds);
+    render(dir, "dust_33", p, sc, seconds);
     p.rpmIndex = 1;
-    render(dir, "dust_45", p, seconds);
+    render(dir, "dust_45", p, sc, seconds);
 
-    p = silent(); p.scratchCount = 2; p.scratchLength = 1.0; p.position = 0.5;
-    render(dir, "scratch_33", p, seconds);
+    p = silent(); p.dropPosition = 0.5; sc = legacyScratches(1, 0, 1.0, 2);
+    render(dir, "scratch_33", p, sc, seconds);
     p.rpmIndex = 1;
-    render(dir, "scratch_45", p, seconds);
+    render(dir, "scratch_45", p, sc, seconds);
     p.rpmIndex = 0;
     for (double pileUp : { 0.3, 0.6, 1.5, 3.0 }) {
         p.scratchPileUpMillimetres = pileUp;
-        render(dir, ("scratch_33_pileup_" + std::to_string(static_cast<int>(pileUp * 10))).c_str(), p, seconds);
+        render(dir, ("scratch_33_pileup_" + std::to_string(static_cast<int>(pileUp * 10))).c_str(), p, sc, seconds);
     }
 
+    // Hand-cut scratches: a short, a medium and a maximum-length cut around the stylus radius.
+    p = silent(); p.dropPosition = 0.5; sc = {};
+    {
+        const double r = dustytable::grooveRadius(dustytable::discGeometry(0), 0.5);
+        sc.add(dustytable::cutScratch(0, r, 0.5, 0.02, 11));
+        sc.add(dustytable::cutScratch(0, r, 2.5, 0.3, 12));
+        sc.add(dustytable::cutScratch(0, r, 4.5, 2.0 / 3.0, 13));
+    }
+    render(dir, "scratch_cut", p, sc, seconds);
+    sc = {};
+
     p = silent(); p.staticAmount = 0.3;
-    render(dir, "static_30", p, seconds);
+    render(dir, "static_30", p, sc, seconds);
     p.staticAmount = 0.6;
-    render(dir, "static", p, seconds);
+    render(dir, "static", p, sc, seconds);
     p.staticAmount = 1.0;
-    render(dir, "static_100", p, seconds);
+    render(dir, "static_100", p, sc, seconds);
 
     // Arm down from the rest at 0.5 s, and up from the disc at 0.5 s.
     p = silent(); p.armDown = false;
-    render(dir, "arm_down", p, 8.0, 48000, [](EngineParams& q, double t) { q.armDown = t >= 0.5; });
+    render(dir, "arm_down", p, sc, 8.0, 48000, [](EngineParams& q, double t) { q.armDown = t >= 0.5; });
     p = silent(); p.armDown = true;
-    render(dir, "arm_up", p, 7.0, 48000, [](EngineParams& q, double t) { q.armDown = t < 0.5; });
+    render(dir, "arm_up", p, sc, 7.0, 48000, [](EngineParams& q, double t) { q.armDown = t < 0.5; });
     // Changing its mind halfway through the arm-down sequence.
     p = silent(); p.armDown = false;
-    render(dir, "arm_reverse", p, 8.0, 48000, [](EngineParams& q, double t) { q.armDown = t >= 0.5 && t < 2.0; });
+    render(dir, "arm_reverse", p, sc, 8.0, 48000, [](EngineParams& q, double t) { q.armDown = t >= 0.5 && t < 2.0; });
     // Several down/up cycles in a row: no two should sound exactly alike.
     p = silent(); p.armDown = false;
-    render(dir, "arm_cycles", p, 40.0, 48000, [](EngineParams& q, double t) { q.armDown = std::fmod(t, 10.0) >= 0.5 && std::fmod(t, 10.0) < 7.0; });
+    render(dir, "arm_cycles", p, sc, 40.0, 48000, [](EngineParams& q, double t) { q.armDown = std::fmod(t, 10.0) >= 0.5 && std::fmod(t, 10.0) < 7.0; });
+    // End of the side: dropped near the end of a 1-minute side, the deck stops by itself
+    // (and stays stopped although Start is still set).
+    p = silent(); p.sideMinutes = 1.0; p.dropPosition = 0.98;
+    render(dir, "end_of_side", p, sc, 8.0, 48000, [](EngineParams& q, double) { q.armDown = true; });
 
-    p = EngineParams {};
-    render(dir, "all_default", p, seconds);
-    render(dir, "all_default_44k", p, seconds, 44100);
-    render(dir, "all_default_96k", p, seconds, 96000);
+    p = EngineParams {}; sc = legacyScratches(1, 0, 0.6, 2);
+    render(dir, "all_default", p, sc, seconds);
+    render(dir, "all_default_44k", p, sc, seconds, 44100);
+    render(dir, "all_default_96k", p, sc, seconds, 96000);
 
     // Stress: heavy dust, deep scratches, light tracking force.
-    p.dustPerMetre = 40.0; p.dustMaxMicrons = 40.0; p.scratchCount = 8; p.scratchDepthMicrons = 60.0;
-    p.scratchLength = 1.0; p.trackingForceGrams = 1.0; p.staticAmount = 1.0;
-    render(dir, "stress", p, seconds);
+    p.dustPerMetre = 40.0; p.dustMaxMicrons = 40.0; p.scratchDepthMicrons = 60.0;
+    p.trackingForceGrams = 1.0; p.staticAmount = 1.0; sc = legacyScratches(1, 0, 1.0, 8);
+    render(dir, "stress", p, sc, seconds);
     p.stylusIndex = 1; p.rpmIndex = 1;
-    render(dir, "stress_elliptic_45", p, seconds);
+    render(dir, "stress_elliptic_45", p, sc, seconds);
     return 0;
 }

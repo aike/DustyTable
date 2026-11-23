@@ -66,4 +66,26 @@ if(DUSTYTABLE_BUILD_PLUGIN)
       juce::juce_recommended_config_flags
       juce::juce_recommended_lto_flags
       juce::juce_recommended_warning_flags)
+
+  # Offscreen check of the editor's record tools (dust, nail, eraser) and of the saved state.
+  juce_add_console_app(DustyTableUiCheck PRODUCT_NAME "DustyTableUiCheck")
+  target_sources(DustyTableUiCheck PRIVATE
+    Tools/UiCheck.cpp
+    Source/DustyTableProcessor.cpp
+    Source/DustyTableEditor.cpp)
+  target_include_directories(DustyTableUiCheck PRIVATE Source)
+  target_compile_definitions(DustyTableUiCheck PRIVATE
+    JucePlugin_Name="DustyTable"
+    JUCE_MODAL_LOOPS_PERMITTED=1
+    JUCE_WEB_BROWSER=0
+    JUCE_USE_CURL=0
+    JUCE_DISPLAY_SPLASH_SCREEN=0)
+  if(MSVC)
+    target_compile_options(DustyTableUiCheck PRIVATE /utf-8)
+  endif()
+  target_link_libraries(DustyTableUiCheck PRIVATE
+    DustyTableDSP
+    juce::juce_audio_utils
+    juce::juce_recommended_config_flags
+    juce::juce_recommended_warning_flags)
 endif()

@@ -15,16 +15,12 @@ struct EngineParams {
     int discIndex = 0;    // 0: 12", 1: 10", 2: 7"
     int stylusIndex = 0;  // 0: conical, 1: elliptical
     double trackingForceGrams = 2.0;
-    double position = 0.0; // 0 = lead-in, 1 = run-out
-    bool autoAdvance = true;
+    double dropPosition = 0.0; // where the arm sets the stylus down: 0 = lead-in, 1 = end of the recorded band
     double sideMinutes = 20.0;
     double dustPerMetre = 6.0;
     double dustMaxMicrons = 12.0;
-    int scratchCount = 2;
     double scratchDepthMicrons = 20.0;
-    double scratchLength = 0.6;
     double scratchPileUpMillimetres = 1.5; // half-width of the pile-up around each cut
-    int scratchSeed = 1;
     double staticAmount = 0.0; // 0..1
     bool armDown = true;
     double cueSeconds = 2.0;   // lifter descent time
@@ -45,16 +41,31 @@ public:
     void setParams(const EngineParams& p);
     // Puts the arm straight on the disc or on the rest, without a sequence.
     void setArmImmediate(bool down);
+    // The scratches cut into the disc (by hand, see DrawnScratch).
+    void setScratches(const ScratchList& list);
 
     // Renders n samples. tStart is the transport time in seconds, which fixes
-    // the disc angle and (with auto advance) the stylus position. cartridge*
+    // the disc angle while the platter runs at speed. cartridge*
     // receive the phono output, mechanics* the airborne sound of the arm
     // mechanism, and contact (0..1) how firmly the stylus sits in the groove.
     void process(float* cartridgeL, float* cartridgeR, float* mechanicsL, float* mechanicsR, float* contact, int n,
         double tStart);
 
     double getPhase() const { return phase; }
+    // Platter speed as a fraction of the nominal speed (0 = standing still).
+    double getPlatterSpeed() const { return platterSpeed; }
+    // Current stylus position (0 = lead-in, 1 = end of the recorded band).
     double getPosition() const { return position; }
+    // Puts the stylus at a saved position (after setArmImmediate(true)).
+    void setStylusPosition(double p);
+    // True once each time the stylus has reached the end of the side and the
+    // deck has stopped by itself; the host-side Start/Stop should follow.
+    bool takeEndOfSide()
+    {
+        const bool r = endOfSidePending;
+        endOfSidePending = false;
+        return r;
+    }
     double getRadius() const { return radius; }
     double getArmTransit() const { return arm.transitPosition(); }
     double getArmHeight() const { return stylus[0].x; }
@@ -115,8 +126,11 @@ private:
     double groovePath = 0.0; // distance travelled along the groove
 
     ScratchSet scratches {};
-    int scratchSeedApplied = -1, scratchDiscApplied = -1;
-    double scratchLengthApplied = -1.0, scratchDepthApplied = -1.0, scratchPileUpApplied = -1.0;
+    ScratchList drawnScratches;
+    int scratchCount = 0;
+    int scratchDiscApplied = -1;
+    double scratchDepthApplied = -1.0, scratchPileUpApplied = -1.0;
+    void rebuildScratches();
 
     double charge = 0.0;
     double chargeDrift = 0.0;
@@ -130,6 +144,16 @@ private:
     double lastLifter = 0.0;
 
     double phase = 0.0, position = 0.0, radius = 0.1;
+
+    // The stylus moves inward with the groove once it has landed; at the end of
+    // the side the deck stops by itself and stays stopped until Stop is set.
+    bool landed = true;
+    bool endOfSide = false, endOfSidePending = false;
+
+    // The platter runs from START until STOP has put the arm back on its rest.
+    bool platterMotor = true;
+    double platterSpeed = 1.0;
+    double platterOffset = 0.0; // disc angle lost to stops, relative to the transport
 };
 
 } // namespace dustytable
