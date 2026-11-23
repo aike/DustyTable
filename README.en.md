@@ -4,6 +4,8 @@
 
 An audio plugin (VST3 / Standalone, JUCE 8) that generates vinyl record noise by physical modelling. It computes the sound of a stylus tracing the groove and adds it to the input signal.
 
+![DustyTable screenshot](ss.png)
+
 ## Features
 
 - **Adds only the noise, leaving the tone of your source untouched** The input signal gets no EQ, saturation, wow & flutter or any other colouring. The only things that touch it are the Dry gain and the mute while the stylus is out of the groove (when a scratch makes the stylus jump, the source dips very slightly, exactly as the physical model says). Shape the sound with your own favourite compressor, EQ and saturator.
@@ -118,8 +120,8 @@ Pushing a tag starting with `v` makes GitHub Actions (`.github/workflows/release
 
 ```
 # after raising VERSION in CMakeLists.txt and committing
-git tag v0.1.0
-git push origin v0.1.0
+git tag v0.2.0
+git push origin v0.2.0
 ```
 
 Running the workflow by hand from the Actions tab builds the zip and stores it as an artifact without creating a release.

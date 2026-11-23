@@ -4,6 +4,8 @@
 
 レコード盤のノイズを物理モデリングで生成するオーディオプラグイン(VST3 / Standalone、JUCE 8)。溝を針がトレースする音を計算し、入力音に加算します。
 
+![DustyTable の画面](ss.png)
+
 ## 特長
 
 - **原音の音質を変えずに、ノイズだけを加えます** 入力音には EQ・サチュレーション・ワウフラッターなどの色付けを一切しません(変わるのは Dry のゲインと、針が溝から離れている間のミュートだけ。キズで針が跳ねた瞬間は、物理モデルどおり原音がわずかに沈みます)。音作りは、好きなコンプレッサー・EQ・サチュレーターで自由に行えます。
@@ -118,8 +120,8 @@ Standalone のアプリアイコンは `Resources/icon_big.png`(1024px)と `Reso
 
 ```
 # CMakeLists.txt の VERSION を上げてコミットしたあとで
-git tag v0.1.0
-git push origin v0.1.0
+git tag v0.2.0
+git push origin v0.2.0
 ```
 
 Actions のタブから手動で実行すると、Release は作らずに zip をビルドして成果物(Artifacts)に置きます。

@@ -1,4 +1,4 @@
-DustyTable(旧名 PhysVinyl) 開発の経緯 (2026-11-24 時点、22. まで)
+DustyTable(旧名 PhysVinyl) 開発の経緯 (2026-11-24 時点、24. まで)
 ========================================
 
 ■ 目的
@@ -259,6 +259,15 @@ DustyTable(旧名 PhysVinyl) 開発の経緯 (2026-11-24 時点、22. まで)
 22. 英語版の README(README.en.md)を追加した(2026-11-24、ユーザーの指示)。
    - README.md(日本語)と同じ構成・内容の英訳。両方の先頭に言語の切り替えリンクを付けた。
    - Release の zip にも README.en.md を入れるようにした。
+
+23. VST3 のメーカー名を aikelab にし、README に画面のスクリーンショットを入れた(2026-11-24、ユーザーの指示)。
+   - CMakeLists.txt の COMPANY_NAME を "dustytable" から "aikelab" に変更(ホストに表示されるメーカー名)。
+     プラグインのID(PLUGIN_MANUFACTURER_CODE Pvnl、PLUGIN_CODE Pvn1)は変えていないので、保存済みのプロジェクトはそのまま開ける。
+   - README.md と README.en.md の冒頭の説明の直後に ss.png を表示。
+
+24. バージョンを 0.1.0 から 0.2.0 に上げた(2026-11-24、ユーザーの指示)。
+   - CMakeLists.txt の project VERSION(プラグインとアプリが報告するバージョン)と、README のリリース手順の例のタグ。
+   - 15.〜23. の機能追加(針のスイッチ、アプリアイコン、直線のキズ、UP/DOWN、半透明のアーム、ライセンス、Release)を受けてマイナー番号を上げた。
 
 ■ 現在の測定値(オフライン書き出しの数値)
 - 接地(カートリッジ経由):約 -6dBFS、低く大きい「ボツッ」(最後の1mm弱を自重で落ちる)
