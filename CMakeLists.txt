@@ -42,6 +42,9 @@ if(DUSTYTABLE_BUILD_PLUGIN)
     NEEDS_MIDI_INPUT FALSE
     NEEDS_MIDI_OUTPUT FALSE
     VST3_CATEGORIES Fx Distortion
+    # Application icon (Standalone .exe/.app). Drawn by Tools/make_icon.py.
+    ICON_BIG "${CMAKE_CURRENT_SOURCE_DIR}/Resources/icon_big.png"
+    ICON_SMALL "${CMAKE_CURRENT_SOURCE_DIR}/Resources/icon_small.png"
     COPY_PLUGIN_AFTER_BUILD FALSE)
 
   target_sources(DustyTable PRIVATE

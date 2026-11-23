@@ -95,6 +95,9 @@ constexpr double minCutLength = 0.002;   // shortest cut, metres
 constexpr double fullCutSeconds = 2.0;   // holding the nail this long gives the longest cut
 constexpr float eraserReach = 12.0f;     // pixels
 constexpr double eraserLookBack = 0.4;   // s: a scratch that has just turned past the pointer still counts
+constexpr double ghostHoldSeconds = 0.8;    // Drop point set by wheel or automation: settled after this long unchanged
+constexpr double ghostFadeInSeconds = 0.08;
+constexpr double ghostFadeOutSeconds = 0.35;
 
 double wrapPi(double a) { return a - dustytable::twoPi * std::floor((a + dustytable::pi) / dustytable::twoPi); }
 
@@ -274,7 +277,15 @@ DiscView::Layout DiscView::layout() const
     // Tonearm: pivot outside the disc, stylus on the current groove radius.
     l.pivot = { l.c.x + l.platterR * 1.05f, l.c.y - l.platterR * 0.85f };
     l.armLength = l.platterR * 1.25f;
-    const float rPx = static_cast<float>(l.radius) * l.scale;
+    l.stylusPt = stylusPointAt(l, l.radius);
+    l.stylusAngle = std::atan2(l.stylusPt.y - l.c.y, l.stylusPt.x - l.c.x);
+    return l;
+}
+
+// Where the arm, swung from its pivot, crosses the groove circle of radius r.
+juce::Point<float> DiscView::stylusPointAt(const Layout& l, double r)
+{
+    const float rPx = static_cast<float>(r) * l.scale;
     const auto toPivot = l.pivot - l.c;
     const float d = toPivot.getDistanceFromOrigin();
     const float a = (rPx * rPx - l.armLength * l.armLength + d * d) / (2.0f * d);
@@ -282,9 +293,14 @@ DiscView::Layout DiscView::layout() const
     const auto basePt = l.c + toPivot * (a / d);
     const juce::Point<float> perp { -toPivot.y / d, toPivot.x / d };
     const auto p1 = basePt + perp * h, p2 = basePt - perp * h;
-    l.stylusPt = p1.y > p2.y ? p1 : p2;
-    l.stylusAngle = std::atan2(l.stylusPt.y - l.c.y, l.stylusPt.x - l.c.x);
-    return l;
+    return p1.y > p2.y ? p1 : p2;
+}
+
+void DiscView::setDropPointDragging(bool dragging)
+{
+    dropDragging = dragging;
+    // Letting go of the knob settles the value: start fading at once.
+    if (!dragging) lastDropChange = -1.0e9;
 }
 
 // A point at disc angle theta is under the stylus when phase == theta; the disc
@@ -487,6 +503,14 @@ void DiscView::tick()
     framePhase -= dustytable::twoPi * std::floor(framePhase / dustytable::twoPi);
     phaseHistory[static_cast<size_t>(phaseHistoryNext)] = { t, framePhase };
     phaseHistoryNext = (phaseHistoryNext + 1) % static_cast<int>(phaseHistory.size());
+
+    // See-through arm at the Drop point: shown while the value is being changed.
+    const float drop = processor.apvts.getRawParameterValue("position")->load();
+    if (lastDropPoint >= 0.0f && drop != lastDropPoint) lastDropChange = t;
+    lastDropPoint = drop;
+    const bool showGhost = dropDragging || t - lastDropChange < ghostHoldSeconds;
+    const float fade = static_cast<float>(dt / (showGhost ? ghostFadeInSeconds : ghostFadeOutSeconds));
+    ghostAlpha = juce::jlimit(0.0f, 1.0f, ghostAlpha + (showGhost ? fade : -fade));
 
     if (!pressing) return;
     const auto l = layout();
@@ -696,6 +720,35 @@ void DiscView::paint(juce::Graphics& g)
         g.fillEllipse(base.x - 3.0f, base.y - 3.0f, 6.0f, 6.0f);
     }
 
+    // See-through arm where the Drop point would set the stylus down.
+    if (ghostAlpha > 0.0f) {
+        const double dropRadius = dustytable::grooveRadius(geom, lastDropPoint * 0.01);
+        const auto ghostStylus = stylusPointAt(L, dropRadius);
+        const float ghostAngle = std::atan2(ghostStylus.y - pivot.y, ghostStylus.x - pivot.x);
+        const juce::Point<float> gdir { std::cos(ghostAngle), std::sin(ghostAngle) };
+        const auto ghostTip = pivot + gdir * armLength;
+        const float a = ghostAlpha;
+        g.setColour(juce::Colour(0xff4a464e).withAlpha(0.35f * a));
+        g.drawLine({ pivot, pivot - gdir * (platterR * 0.22f) }, 12.0f);
+        g.setColour(juce::Colour(0xffc9c4bc).withAlpha(0.4f * a));
+        g.drawLine({ pivot, ghostTip - gdir * 14.0f }, 4.0f);
+        {
+            juce::Graphics::ScopedSaveState state(g);
+            g.addTransform(juce::AffineTransform::rotation(ghostAngle, ghostTip.x, ghostTip.y));
+            const juce::Rectangle<float> shell { ghostTip.x - 22.0f, ghostTip.y - 7.0f, 26.0f, 14.0f };
+            g.setColour(juce::Colour(0xff2f2c33).withAlpha(0.45f * a));
+            g.fillRoundedRectangle(shell, 3.0f);
+            g.setColour(colours::accent.withAlpha(0.55f * a));
+            g.drawRoundedRectangle(shell, 3.0f, 1.0f);
+        }
+        // The groove it would land on.
+        const float rPx = static_cast<float>(dropRadius) * scale;
+        g.setColour(colours::accent.withAlpha(0.18f * a));
+        g.drawEllipse(c.x - rPx, c.y - rPx, rPx * 2.0f, rPx * 2.0f, 1.0f);
+        g.setColour(colours::accent.withAlpha(0.8f * a));
+        g.fillEllipse(ghostStylus.x - 2.5f, ghostStylus.y - 2.5f, 5.0f, 5.0f);
+    }
+
     // Arm shadow: the higher the arm, the further the shadow falls.
     const auto shadowOffset = juce::Point<float> { 3.0f, 4.0f } * (0.6f + 3.0f * lift);
     g.setColour(juce::Colours::black.withAlpha(0.45f));
@@ -747,10 +800,148 @@ void DiscView::paint(juce::Graphics& g)
 }
 
 //==============================================================================
+namespace {
+const char* const stylusNames[] = { "Conical", "Elliptical" };
+const char* const stylusTips[] = {
+    "Conical stylus: round 0.7 mil tip",
+    "Elliptical stylus: 0.3 x 0.7 mil tip, narrow along the groove so it follows finer detail",
+};
+} // namespace
+
+StylusSwitch::StylusSwitch(juce::RangedAudioParameter& param)
+    : attachment(param, [this](float value) {
+        selected = juce::jlimit(0, 1, juce::roundToInt(value));
+        repaint();
+    })
+{
+    setTitle("Stylus");
+    setMouseCursor(juce::MouseCursor::PointingHandCursor);
+    attachment.sendInitialUpdate();
+}
+
+int StylusSwitch::segmentAt(juce::Point<float> pos) const
+{
+    if (!getLocalBounds().toFloat().contains(pos)) return -1;
+    return pos.x < getWidth() * 0.5f ? 0 : 1;
+}
+
+void StylusSwitch::mouseDown(const juce::MouseEvent& e)
+{
+    const int segment = segmentAt(e.position);
+    if (segment >= 0 && segment != selected) attachment.setValueAsCompleteGesture(static_cast<float>(segment));
+}
+
+void StylusSwitch::mouseMove(const juce::MouseEvent& e)
+{
+    const int segment = segmentAt(e.position);
+    if (segment != hovered) {
+        hovered = segment;
+        setTooltip(segment >= 0 ? stylusTips[segment] : "");
+        repaint();
+    }
+}
+
+void StylusSwitch::mouseExit(const juce::MouseEvent&)
+{
+    hovered = -1;
+    repaint();
+}
+
+// Groove seen from above, running left to right, with the diamond's contact
+// footprint resting between the two walls. Drawn as fine line work in muted
+// metallic tones: champagne when selected, pewter otherwise.
+void StylusSwitch::drawTip(juce::Graphics& g, int stylusIndex, juce::Rectangle<float> area, bool on)
+{
+    const juce::Colour metal = on ? juce::Colour(0xffd2bd94) : juce::Colour(0xff8c857c);
+    const juce::Colour deep = on ? juce::Colour(0xff5e4a2c) : juce::Colour(0xff3a3632);
+    const auto c = area.getCentre();
+    const float halfWidth = area.getHeight() * 0.28f;
+    const float wiggle = area.getHeight() * 0.035f;
+    const float k = juce::MathConstants<float>::twoPi / (area.getWidth() * 0.5f);
+
+    auto wall = [&](float offset) {
+        juce::Path p;
+        for (float x = area.getX(); x <= area.getRight() + 0.01f; x += 0.5f) {
+            const juce::Point<float> pt { x, c.y + offset + wiggle * std::sin(k * (x - c.x)) };
+            if (x == area.getX()) p.startNewSubPath(pt);
+            else p.lineTo(pt);
+        }
+        return p;
+    };
+    // Fade the groove out towards both ends.
+    juce::ColourGradient fade(metal.withAlpha(0.0f), area.getX(), c.y, metal.withAlpha(0.0f), area.getRight(), c.y,
+        false);
+    fade.addColour(0.25, metal.withAlpha(0.55f));
+    fade.addColour(0.75, metal.withAlpha(0.55f));
+    g.setGradientFill(fade);
+    g.strokePath(wall(-halfWidth), juce::PathStrokeType(0.9f));
+    g.strokePath(wall(halfWidth), juce::PathStrokeType(0.9f));
+    // Neighbouring grooves, fainter.
+    g.setColour(metal.withAlpha(0.14f));
+    g.strokePath(wall(-halfWidth * 2.3f), juce::PathStrokeType(0.6f));
+    g.strokePath(wall(halfWidth * 2.3f), juce::PathStrokeType(0.6f));
+
+    // Footprint: a circle for the conical tip, a narrow ellipse for the elliptical one.
+    const float ry = halfWidth;
+    const float rx = stylusIndex == 1 ? halfWidth * 0.42f : halfWidth;
+    const juce::Rectangle<float> tip { c.x - rx, c.y - ry, rx * 2.0f, ry * 2.0f };
+    g.setColour(juce::Colours::black.withAlpha(0.35f));
+    g.fillEllipse(tip.translated(0.0f, 1.0f).expanded(0.6f));
+    juce::ColourGradient body(metal.brighter(0.25f), c.x - rx * 0.5f, c.y - ry * 0.7f, deep, c.x + rx * 0.6f,
+        c.y + ry, false);
+    g.setGradientFill(body);
+    g.fillEllipse(tip);
+    // Facet lines of the diamond and a small highlight.
+    g.setColour(metal.brighter(0.4f).withAlpha(0.35f));
+    g.drawLine(c.x - rx * 0.55f, c.y, c.x + rx * 0.55f, c.y, 0.6f);
+    g.drawLine(c.x, c.y - ry * 0.6f, c.x, c.y + ry * 0.6f, 0.6f);
+    g.setColour(juce::Colours::white.withAlpha(on ? 0.5f : 0.25f));
+    g.fillEllipse(c.x - rx * 0.45f, c.y - ry * 0.62f, rx * 0.42f, ry * 0.3f);
+    g.setColour(metal.brighter(0.2f));
+    g.drawEllipse(tip, 0.8f);
+}
+
+void StylusSwitch::paint(juce::Graphics& g)
+{
+    const juce::Colour gold(0xffd2bd94);
+    const auto bounds = getLocalBounds().toFloat().reduced(0.5f);
+    const float corner = 4.0f;
+    g.setGradientFill(juce::ColourGradient(juce::Colour(0xff1b191d), 0.0f, bounds.getY(), juce::Colour(0xff141215), 0.0f,
+        bounds.getBottom(), false));
+    g.fillRoundedRectangle(bounds, corner);
+
+    const float segmentWidth = bounds.getWidth() * 0.5f;
+    for (int i = 0; i < 2; ++i) {
+        const auto seg = bounds.withWidth(segmentWidth).translated(i * segmentWidth, 0.0f);
+        const bool on = i == selected;
+        const auto inner = seg.reduced(2.5f);
+        if (on) {
+            g.setGradientFill(juce::ColourGradient(juce::Colour(0xff2e2a2c), 0.0f, inner.getY(),
+                juce::Colour(0xff242123), 0.0f, inner.getBottom(), false));
+            g.fillRoundedRectangle(inner, corner - 1.0f);
+            g.setColour(gold.withAlpha(0.7f));
+            g.drawRoundedRectangle(inner, corner - 1.0f, 0.8f);
+        } else if (i == hovered) {
+            g.setColour(juce::Colours::white.withAlpha(0.04f));
+            g.fillRoundedRectangle(inner, corner - 1.0f);
+        }
+        auto content = seg.reduced(8.0f, 6.0f);
+        drawTip(g, i, content.removeFromLeft(content.getHeight() * 1.5f), on);
+        content.removeFromLeft(7.0f);
+        g.setColour(on ? gold : juce::Colour(0xff7d766e));
+        g.setFont(juce::FontOptions(12.5f).withKerningFactor(0.03f));
+        g.drawFittedText(stylusNames[i], content.toNearestInt(), juce::Justification::centredLeft, 1, 0.8f);
+    }
+    g.setColour(juce::Colour(0xff4a4448));
+    g.drawRoundedRectangle(bounds, corner, 0.8f);
+}
+
+//==============================================================================
 DustyTableEditor::DustyTableEditor(DustyTableProcessor& p)
     : AudioProcessorEditor(&p)
     , processor(p)
     , disc(p)
+    , stylusSwitch(*p.apvts.getParameter("stylus"))
 {
     setLookAndFeel(&lookAndFeel);
     addAndMakeVisible(disc);
@@ -777,9 +968,8 @@ DustyTableEditor::DustyTableEditor(DustyTableProcessor& p)
     rpm45.setConnectedEdges(juce::Button::ConnectedOnLeft);
 
     discBox.addItemList({ "12\"", "10\"", "7\"" }, 1);
-    stylusBox.addItemList({ "Conical", "Elliptical" }, 1);
     addAndMakeVisible(discBox);
-    addAndMakeVisible(stylusBox);
+    addAndMakeVisible(stylusSwitch);
     // Deck buttons: START lowers the arm onto the record, STOP returns it.
     startButton.onClick = [this] { setArm(true); };
     stopButton.onClick = [this] { setArm(false); };
@@ -787,8 +977,13 @@ DustyTableEditor::DustyTableEditor(DustyTableProcessor& p)
     stopButton.setConnectedEdges(juce::Button::ConnectedOnLeft);
     addAndMakeVisible(startButton);
     addAndMakeVisible(stopButton);
+    // Cue: raises the arm where it is, or lowers it again. While it is up the
+    // arm turns slowly to the Drop point.
+    cueButton.setClickingTogglesState(false);
+    cueButton.setTooltip("Raise or lower the arm where it is. While it is up, the arm moves to the Drop point.");
+    cueButton.onClick = [this] { processor.requestCueToggle(); };
+    addAndMakeVisible(cueButton);
     discAttachment = std::make_unique<juce::AudioProcessorValueTreeState::ComboBoxAttachment>(p.apvts, "disc", discBox);
-    stylusAttachment = std::make_unique<juce::AudioProcessorValueTreeState::ComboBoxAttachment>(p.apvts, "stylus", stylusBox);
 
     setSize(discWidth + panelWidth, editorHeight);
     timerCallback();
@@ -809,6 +1004,10 @@ DustyTableEditor::Knob* DustyTableEditor::addKnob(const juce::String& paramId, c
     knob->label.setFont(juce::FontOptions(13.0f));
     addAndMakeVisible(knob->slider);
     addAndMakeVisible(knob->label);
+    if (paramId == "position") {
+        knob->slider.onDragStart = [this] { disc.setDropPointDragging(true); };
+        knob->slider.onDragEnd = [this] { disc.setDropPointDragging(false); };
+    }
     knob->attachment = std::make_unique<juce::AudioProcessorValueTreeState::SliderAttachment>(processor.apvts, paramId,
         knob->slider);
     knobs.push_back(std::move(knob));
@@ -877,17 +1076,19 @@ void DustyTableEditor::resized()
     disc.setBounds(area.removeFromLeft(discWidth));
     startButton.setBounds(discWidth - 150, editorHeight - 46, 67, 30);
     stopButton.setBounds(discWidth - 83, editorHeight - 46, 67, 30);
+    cueButton.setBounds(discWidth - 150, editorHeight - 82, 134, 30); // above START/STOP, clear of the info line
 
     auto panel = area.reduced(12, 0);
     panel.removeFromTop(60);
-    auto selectors = panel.removeFromTop(28);
-    rpm33.setBounds(selectors.removeFromLeft(50));
-    rpm45.setBounds(selectors.removeFromLeft(50));
-    selectors.removeFromLeft(8);
-    discBox.setBounds(selectors.removeFromLeft(70));
-    selectors.removeFromLeft(8);
-    stylusBox.setBounds(selectors.removeFromLeft(104));
-    panel.removeFromTop(12);
+    auto selectors = panel.removeFromTop(40);
+    auto small = selectors.withSizeKeepingCentre(selectors.getWidth(), 28);
+    rpm33.setBounds(small.removeFromLeft(46));
+    rpm45.setBounds(small.removeFromLeft(46));
+    small.removeFromLeft(8);
+    discBox.setBounds(small.removeFromLeft(64));
+    selectors.removeFromLeft(46 + 46 + 8 + 64 + 10);
+    stylusSwitch.setBounds(selectors);
+    panel.removeFromTop(6);
 
     // Rows: DECK | SCRATCH + DUST + STATIC ELECTRICITY | OUTPUT. Cells shrink when
     // a row holds more knobs than fit; the last section takes the rest of the row.

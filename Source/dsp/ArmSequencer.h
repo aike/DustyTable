@@ -15,17 +15,30 @@ constexpr double lifterDown = -3.0e-3; // lifter parked below the arm
 constexpr double cradle = 1.5e-3;     // arm tube resting on the arm rest
 } // namespace armHeights
 
-// Small brushed DC motor driving the arm cam through a worm and a spur stage.
-// The electrical and mechanical equations are integrated per output sample;
-// the forces it puts into its mount and gearbox are what is heard.
+// Small brushed DC motor driving a cam (or the arm) through a worm and spur
+// gearing. The electrical and mechanical equations are integrated per output
+// sample; the forces it puts into its mount and gearbox are what is heard.
+// The same motor type works the arm cam, the cue cam and the arm traverse;
+// only the gearing differs.
 class CamMotor {
 public:
-    static constexpr double camTravel = twoPi;    // one cam revolution: down half, then up half
-    static constexpr double wormRatio = 30.0;     // single-start worm, 30-tooth wheel
-    static constexpr double spurRatio = 11.0;     // 8-tooth pinion, 88-tooth cam gear
-    static constexpr int wheelTeeth = 30;
-    static constexpr int pinionTeeth = 8;
-    static constexpr int camTeeth = 88;
+    struct Gearing {
+        double wormRatio;  // single-start worm: teeth of the worm wheel
+        double spurRatio;  // spur stages after the worm wheel, overall
+        int wheelTeeth;    // worm wheel
+        int pinionTeeth;   // first spur pinion
+        int gearTeeth;     // the gear it drives
+    };
+    // Arm cam: 30-tooth worm wheel, 8-tooth pinion on an 88-tooth cam gear.
+    static constexpr Gearing armCam { 30.0, 11.0, 30, 8, 88 };
+    static constexpr double camTravel = twoPi; // one output revolution
+
+    explicit CamMotor(const Gearing& g = armCam, uint64_t seed = 4242)
+        : gearing(g)
+        , rng(seed)
+    {
+    }
+    const Gearing& getGearing() const { return gearing; }
 
     void prepare(double newSampleRate)
     {
@@ -38,10 +51,12 @@ public:
         voltage = 0.0;
     }
     // off = terminals shorted (braked). The supply sags a little differently each
-    // run (battery, contact resistance), which shifts the motor speed and the gear whine.
+    // run (battery, contact resistance), which shifts the motor speed and the gear
+    // whine. A negative scale runs the motor backwards.
     void setDrive(bool on, double supplyScale = 1.0) { voltage = on ? supply * supplyScale : 0.0; }
+    bool driven() const { return voltage != 0.0; }
 
-    // Advances one output sample; returns the change of cam phase (1 per revolution).
+    // Advances one output sample; returns the change of output phase (1 per revolution).
     double tick()
     {
         const double dt = 1.0 / sampleRate;
@@ -60,10 +75,11 @@ public:
         if (angle > twoPi * 1000.0 || angle < -twoPi * 1000.0) angle = std::fmod(angle, twoPi);
         wormAngle += omega * dt;
         // Worm position kept within whole revolutions of the cam gear so the tooth indices stay exact.
-        const double camGearTurn = twoPi * wormRatio * spurRatio;
-        if (wormAngle > camGearTurn) wormAngle -= camGearTurn;
+        const double gearTurn = twoPi * gearing.wormRatio * gearing.gearTeeth / gearing.pinionTeeth;
+        if (wormAngle > gearTurn) wormAngle -= gearTurn;
+        if (wormAngle < 0.0) wormAngle += gearTurn;
         brushTorque = brush;
-        return omega * dt / (wormRatio * spurRatio * camTravel);
+        return omega * dt / (gearing.wormRatio * gearing.spurRatio * camTravel);
     }
 
     bool running() const { return voltage != 0.0 || std::abs(omega) > 1.0; }
@@ -75,7 +91,7 @@ public:
     // Teeth that have passed through each mesh: the worm wheel and the pinion /
     // cam gear pair (whole numbers index the individual teeth).
     double wormMesh() const { return wormAngle / twoPi; }
-    double spurMesh() const { return wormAngle / (twoPi * wormRatio) * pinionTeeth; }
+    double spurMesh() const { return wormAngle / (twoPi * gearing.wormRatio) * gearing.pinionTeeth; }
 
 private:
     // 1.5 V drive of a small 3 V motor (no-load about 5000 rpm at 1.5 V).
@@ -92,7 +108,8 @@ private:
     double sampleRate = 48000.0, currentStep = 0.1;
     double voltage = 0.0, current = 0.0, omega = 0.0, angle = 0.0, wormAngle = 0.0;
     double torque = 0.0, brushTorque = 0.0, segmentRoughness = 0.0;
-    Rng rng { 4242 };
+    Gearing gearing;
+    Rng rng;
 };
 
 // Operates the turntable like an automatic deck: START and STOP push buttons,
@@ -111,8 +128,22 @@ private:
 // rod then sinks at its own pace. The arm is swung through a slipping clutch,
 // and the cam travels slightly past the arm-rest stop so that the arm is
 // pressed against it.
+//
+// Cueing in place: a second motor turns a cue cam that pushes the same lifter
+// rod through its own lever (a smooth track, no step: half a turn raises, the
+// next half lets the rod sink through the oil damper). A single UP/DOWN button
+// toggles it; the mechanism, not the button, remembers whether the arm is
+// cued up. While the arm is held up over the record a third motor can turn
+// the arm about its pivot through a worm and a slipping clutch.
 class ArmSequencer {
 public:
+    // Cue cam: 30-tooth worm wheel, 10-tooth pinion on a 34-tooth cam gear (half a turn in about 1 s).
+    static constexpr CamMotor::Gearing cueGearing { 30.0, 3.4, 30, 10, 34 };
+    // Arm traverse: 40-tooth worm wheel and spur stages down to the arm pivot
+    // (8-tooth pinion on a 48-tooth gear first), about 8 mm/s at the stylus.
+    static constexpr CamMotor::Gearing traverseGearing { 40.0, 230.0, 40, 8, 48 };
+    static constexpr double armLength = 0.23; // m, pivot to stylus
+
     enum class Event { None, ClampOpen, ClampClose, PressStart, PressStop, SwitchIn, SwitchOut, ArmStop };
 
     static constexpr double followerRise = 1.5e-3;   // m, lift of the follower lever on the cam
@@ -138,12 +169,59 @@ public:
         lifterVelocity = 0.0;
         motor.reset();
         stepCount = stepIndex = 0;
+        cueWanted = cueAtTop = false;
+        cueCam = cueRest;
+        cueMotor.reset();
+        traverseMotor.reset();
+        traverseDirection = 0;
+        traverseStep = 0.0;
+    }
+    // A loaded session with the arm cued up over the record (after setImmediate(true)).
+    void setCueImmediate(bool up)
+    {
+        cueWanted = cueAtTop = up && targetDown;
+        cueCam = (cueWanted ? 0.5 : 0.0) + cueRest;
+        if (cueWanted) lifter = armHeights::lifterUp;
+        cueMotor.reset();
+    }
+
+    // The UP/DOWN button. Only works while the deck is started (the arm is
+    // over the record or on its way there); if pressed while the arm is still
+    // coming down after START, the cue raises it once it has settled.
+    void toggleCue()
+    {
+        if (targetDown) cueWanted = !cueWanted;
+    }
+    bool wantsCueUp() const { return cueWanted; }
+    // The arm is held up by the cue over the record and the cue has finished raising it.
+    bool cueHolding() const
+    {
+        return cueWanted && cueAtTop && !cueMotor.running() && overDisc() && !isBusy()
+               && lifter >= armHeights::lifterUp - 1e-6;
+    }
+    // Asks the traverse motor to turn the arm inward (+1), outward (-1) or to brake (0).
+    // It only runs while the cue holds the arm up.
+    void setTraverse(int direction)
+    {
+        if (!cueHolding()) direction = 0;
+        if (direction == traverseDirection) return;
+        traverseDirection = direction;
+        if (direction == 0) traverseMotor.setDrive(false);
+        else traverseMotor.setDrive(true, direction * (0.97 + 0.06 * rng.uniform()));
+    }
+    // Distance (m) the stylus moved inward on the last tick.
+    double traverseMetres() const { return traverseStep; }
+    // Stylus speed (m/s) the traverse is running at.
+    double traverseSpeed() const
+    {
+        return traverseMotor.speed() / (traverseGearing.wormRatio * traverseGearing.spurRatio) * armLength;
     }
 
     void request(bool down)
     {
         if (down == targetDown) return;
         targetDown = down;
+        if (!down) cueWanted = false; // STOP: the cue lets go while the arm cam lifts and returns the arm
         plan();
     }
 
@@ -196,8 +274,13 @@ public:
             arriveAt(false);
         }
 
+        tickCue();
+        traverseStep = 0.0;
+        if (traverseMotor.running()) traverseStep = traverseMotor.tick() * twoPi * armLength;
+
         const double previousLifter = lifter;
-        const double follower = followerProfile(cam);
+        // The arm cam's lever and the cue cam's lever both push the rod up.
+        const double follower = std::max(followerProfile(cam), cueProfile(cueCam));
         const double rod = armHeights::lifterDown + (armHeights::lifterUp - armHeights::lifterDown) * follower;
         if (rod >= lifter) {
             lifter = rod;
@@ -237,6 +320,8 @@ public:
     bool isBusy() const { return stepIndex < stepCount; }
     bool wantsDown() const { return targetDown; }
     const CamMotor& getMotor() const { return motor; }
+    const CamMotor& getCueMotor() const { return cueMotor; }
+    const CamMotor& getTraverseMotor() const { return traverseMotor; }
 
 private:
     enum class Kind { Wait, ClampOpen, ClampClose, Press, RunCam, WaitLifterParked, WaitArmOnRest };
@@ -269,6 +354,39 @@ private:
     {
         const double travel = (1.0 + overTravel) * ramp(half(phase), 0.32, 0.64);
         return phase < 0.5 ? -overTravel + travel : 1.0 - travel;
+    }
+
+    // Cue cam track: up over most of the first half, down over the second.
+    static double cueProfile(double phase)
+    {
+        const double h = half(phase);
+        return phase < 0.5 ? ramp(h, 0.1, 0.85) : 1.0 - ramp(h, 0.1, 0.85);
+    }
+    void tickCue()
+    {
+        if (!cueMotor.driven() && cueWanted != cueAtTop) {
+            // Raising waits until the arm has settled on the record after START.
+            if (!cueWanted || (!isBusy() && targetDown && overDisc()))
+                cueMotor.setDrive(true, 0.94 + 0.08 * rng.uniform());
+        }
+        if (!cueMotor.running()) return;
+        const double previous = cueCam;
+        cueCam += cueMotor.tick();
+        for (int k = 0; k < 2; ++k) {
+            const double exit = 0.5 * k + cueNotchExit;
+            if (previous < exit && cueCam >= exit) push(Event::SwitchOut);
+        }
+        const auto arrive = [this](bool top) {
+            cueAtTop = top;
+            // A press while the cam was turning changes where it stops.
+            if (top == cueWanted) cueMotor.setDrive(false);
+            push(Event::SwitchIn);
+        };
+        if (previous < 0.5 && cueCam >= 0.5) arrive(true);
+        if (cueCam >= 1.0) {
+            cueCam -= 1.0;
+            arrive(false);
+        }
     }
 
     bool atStation(bool down) const
@@ -334,6 +452,17 @@ private:
     double stopSpeed = 0.0;
     double lifter = armHeights::lifterDown, lifterVelocity = 0.0;
     CamMotor motor;
+    // Cue in place and arm traverse.
+    // The cue cam is geared three times faster than the arm cam, so it runs on
+    // further after the brake: its notches are wider.
+    static constexpr double cueNotchExit = 0.06;
+    static constexpr double cueRest = 0.02; // where the cue cam stands after the leaf has dropped in
+    bool cueWanted = false, cueAtTop = false;
+    double cueCam = cueRest;
+    CamMotor cueMotor { cueGearing, 5151 };
+    CamMotor traverseMotor { traverseGearing, 6262 };
+    int traverseDirection = 0;
+    double traverseStep = 0.0;
     std::array<Step, 8> steps {};
     std::array<Event, 4> events {};
     int eventCount = 0;

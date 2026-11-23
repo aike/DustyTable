@@ -248,6 +248,69 @@ int main(int argc, char** argv)
             "old session: 3 generated scratches taken over, old parameters dropped");
     }
 
+    // ---- See-through arm at the Drop point ----
+    {
+        Check c(dir);
+        juce::Slider* drop = nullptr;
+        for (auto* child : c.editor->getChildren())
+            if (auto* sl = dynamic_cast<juce::Slider*>(child); sl != nullptr && sl->onDragStart) drop = sl;
+        expect(drop != nullptr, "Drop point knob found");
+        if (drop != nullptr) {
+            c.frames(0.2);
+            expect(c.disc->getDropGhostAlpha() == 0.0f, "no see-through arm at rest");
+            drop->onDragStart();
+            drop->setValue(70.0, juce::sendNotificationSync);
+            c.frames(0.3);
+            const float dragging = c.disc->getDropGhostAlpha();
+            c.frames(1.2); // still holding the knob without moving it
+            const float held = c.disc->getDropGhostAlpha();
+            c.report("21_drop_point_ghost");
+            drop->onDragEnd();
+            c.frames(0.6);
+            std::printf("    ghost alpha: dragging %.2f, held 1.5 s %.2f, 0.6 s after release %.2f\n", dragging, held,
+                c.disc->getDropGhostAlpha());
+            expect(dragging > 0.99f && held > 0.99f, "see-through arm shown while the Drop point knob is dragged");
+            expect(c.disc->getDropGhostAlpha() == 0.0f, "see-through arm gone once the knob is released");
+            // Set without dragging (automation, mouse wheel): shown, then gone when the value stays put.
+            auto* param = c.processor.apvts.getParameter("position");
+            param->setValueNotifyingHost(param->convertTo0to1(30.0f));
+            c.frames(0.3);
+            const float shown = c.disc->getDropGhostAlpha();
+            c.frames(1.3);
+            expect(shown > 0.99f && c.disc->getDropGhostAlpha() == 0.0f,
+                "a Drop point change from automation shows the see-through arm briefly");
+        }
+    }
+
+    // ---- Stylus switch ----
+    {
+        Check c(dir);
+        StylusSwitch* sw = nullptr;
+        for (auto* child : c.editor->getChildren())
+            if (auto* s = dynamic_cast<StylusSwitch*>(child)) sw = s;
+        expect(sw != nullptr, "stylus switch is on the panel");
+        if (sw != nullptr) {
+            auto* stylus = c.processor.apvts.getRawParameterValue("stylus");
+            auto click = [&](float x) {
+                const juce::Point<float> pos { x, sw->getHeight() * 0.5f };
+                auto source = juce::Desktop::getInstance().getMainMouseSource();
+                sw->mouseDown(juce::MouseEvent(source, pos, juce::ModifierKeys(juce::ModifierKeys::leftButtonModifier),
+                    1.0f, 0.0f, 0.0f, 0.0f, 0.0f, sw, sw, juce::Time::getCurrentTime(), pos, juce::Time::getCurrentTime(),
+                    1, false));
+            };
+            expect(stylus->load() < 0.5f && sw->getSelectedIndex() == 0, "conical selected by default");
+            click(sw->getWidth() * 0.75f);
+            expect(stylus->load() > 0.5f && sw->getSelectedIndex() == 1, "clicking the right side selects elliptical");
+            c.report("20_stylus_elliptical");
+            click(sw->getWidth() * 0.25f);
+            expect(stylus->load() < 0.5f && sw->getSelectedIndex() == 0, "clicking the left side selects conical");
+            auto* param = c.processor.apvts.getParameter("stylus");
+            param->setValueNotifyingHost(1.0f);
+            juce::MessageManager::getInstance()->runDispatchLoopUntil(50);
+            expect(sw->getSelectedIndex() == 1, "switch follows the parameter (automation)");
+        }
+    }
+
     // ---- Stylus travel (processor with audio blocks) ----
     auto setParam = [](DustyTableProcessor& p, const char* id, float value) {
         auto* param = p.apvts.getParameter(id);
@@ -290,6 +353,69 @@ int main(int argc, char** argv)
         std::printf("    saved mid-side: stylus %.5f -> %.5f after reload\n", p.uiPosition.load(), q.uiPosition.load());
         expect(std::abs(q.uiPosition.load() - p.uiPosition.load()) < 1e-4 && p.uiPosition.load() > 0.002,
             "a session saved mid-side resumes at the saved stylus position");
+    }
+
+    // ---- Cue in place (UP/DOWN) ----
+    {
+        DustyTableProcessor p;
+        setParam(p, "position", 20.0f);
+        p.prepareToPlay(48000.0, 512);
+        run(p, 0.5);
+        const double before = p.uiPosition.load();
+        p.requestCueToggle();
+        run(p, 3.0);
+        std::printf("    cue up: arm height %.2f mm, stylus %.4f\n", p.uiArmHeight.load() * 1e3, p.uiPosition.load());
+        expect(p.uiCueUp.load() && p.uiArmHeight.load() > 3e-3, "UP/DOWN raises the arm in place");
+        expect(std::abs(p.uiPosition.load() - before) < 0.002, "the arm stays where it was when raised");
+        setParam(p, "position", 60.0f);
+        run(p, 3.0);
+        const double moving = p.uiPosition.load();
+        run(p, 12.0);
+        std::printf("    drop point 60 %%: stylus %.4f after 3 s, %.4f after 15 s\n", moving, p.uiPosition.load());
+        expect(moving > 0.25 && moving < 0.55, "the raised arm moves slowly towards the drop point");
+        expect(std::abs(p.uiPosition.load() - 0.6) < 0.003, "the raised arm stops at the drop point");
+
+        juce::MemoryBlock state;
+        p.getStateInformation(state);
+        DustyTableProcessor q;
+        q.setStateInformation(state.getData(), static_cast<int>(state.getSize()));
+        q.prepareToPlay(48000.0, 512);
+        run(q, 0.1);
+        expect(q.uiCueUp.load() && q.uiArmHeight.load() > 3e-3 && std::abs(q.uiPosition.load() - 0.6) < 0.003,
+            "a session saved with the arm cued up reopens with the arm held up at its position");
+
+        p.requestCueToggle();
+        run(p, 4.0);
+        const double landed = p.uiPosition.load();
+        run(p, 1.0);
+        std::printf("    cue down: arm height %.3f mm, stylus %.5f -> %.5f\n", p.uiArmHeight.load() * 1e3, landed,
+            p.uiPosition.load());
+        expect(!p.uiCueUp.load() && p.uiArmHeight.load() < 0.0, "UP/DOWN lowers the arm onto the record");
+        expect(p.uiPosition.load() > landed && std::abs(landed - 0.6) < 0.003, "play continues from where it was lowered");
+
+        // Moved while playing: nothing happens until the arm is raised, then it moves.
+        const double playing = p.uiPosition.load();
+        setParam(p, "position", 40.0f);
+        run(p, 1.0);
+        // A 20-minute side moves the stylus about 0.0008 per second.
+        expect(p.uiPosition.load() > playing && p.uiPosition.load() - playing < 0.0015,
+            "moving the drop point while playing does not move the arm");
+        const double beforeRaise = p.uiPosition.load();
+        p.requestCueToggle();
+        run(p, 1.2);
+        const double raised = p.uiPosition.load();
+        run(p, 14.0);
+        std::printf("    raised after moving the drop point to 40 %%: stylus %.4f -> %.4f\n", raised, p.uiPosition.load());
+        expect(std::abs(raised - beforeRaise) < 0.001 && std::abs(p.uiPosition.load() - 0.4) < 0.003,
+            "after raising, the arm moves to the new drop point");
+
+        // STOP while cued up returns the arm; UP/DOWN does nothing while it rests.
+        setParam(p, "arm", 0.0f);
+        run(p, 8.0);
+        expect(!p.uiCueUp.load() && p.uiArmTransit.load() <= 0.0, "STOP while cued up returns the arm to its rest");
+        p.requestCueToggle();
+        run(p, 2.0);
+        expect(!p.uiCueUp.load() && p.uiArmTransit.load() <= 0.0, "UP/DOWN does nothing while the arm is on its rest");
     }
 
     std::printf("%d failure(s)\n", failures);

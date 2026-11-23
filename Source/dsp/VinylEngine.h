@@ -58,6 +58,13 @@ public:
     double getPosition() const { return position; }
     // Puts the stylus at a saved position (after setArmImmediate(true)).
     void setStylusPosition(double p);
+    // The UP/DOWN button: raises the arm where it is, or lowers it again. While
+    // the arm is held up, it is turned (slowly) to the drop point.
+    void toggleCue() { arm.toggleCue(); }
+    // Whether the cue mechanism holds (or is about to hold) the arm up.
+    bool isCueUp() const { return arm.wantsCueUp(); }
+    // A loaded session with the arm cued up (after setArmImmediate(true) and setStylusPosition).
+    void setCueImmediate(bool up);
     // True once each time the stylus has reached the end of the side and the
     // deck has stopped by itself; the host-side Start/Stop should follow.
     bool takeEndOfSide()
@@ -148,6 +155,7 @@ private:
     // The stylus moves inward with the groove once it has landed; at the end of
     // the side the deck stops by itself and stays stopped until Stop is set.
     bool landed = true;
+    int traverseDirection = 0; // arm traverse towards the drop point while cued up
     bool endOfSide = false, endOfSidePending = false;
 
     // The platter runs from START until STOP has put the arm back on its rest.

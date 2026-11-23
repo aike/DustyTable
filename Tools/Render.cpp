@@ -228,6 +228,58 @@ int main(int argc, char** argv)
     p = silent(); p.sideMinutes = 1.0; p.dropPosition = 0.98;
     render(dir, "end_of_side", p, sc, 8.0, 48000, [](EngineParams& q, double) { q.armDown = true; });
 
+    // Cue in place: START, UP at 9 s, the drop point moved from 20 % to 60 % at 11 s
+    // (the arm follows), DOWN at 20 s; then the drop point moved back to 30 % while
+    // playing, UP at 26 s (the arm moves once it is up), STOP at 40 s while still cued up.
+    {
+        VinylEngine engine;
+        EngineParams q = silent();
+        q.armDown = false;
+        q.dropPosition = 0.2;
+        q.sideMinutes = 40.0;
+        const int rate = 48000, block = 512;
+        engine.prepare(rate);
+        engine.setParams(q);
+        engine.setArmImmediate(false);
+        const double seconds = 48.0;
+        const int n = static_cast<int>(seconds * rate);
+        std::vector<float> l(n), r(n), ml(n), mr(n), contact(n);
+        const double band = dustytable::discGeometry(0).outerGroove - dustytable::discGeometry(0).innerGroove;
+        double lastPos = engine.getPosition(), lastLogged = -1.0;
+        bool wasCue = false;
+        for (int i = 0; i < n; i += block) {
+            const double t = static_cast<double>(i) / rate;
+            q.armDown = t >= 0.5 && t < 40.0;
+            q.dropPosition = t < 11.0 ? 0.2 : (t < 22.0 ? 0.6 : 0.3);
+            engine.setParams(q);
+            for (double at : { 9.0, 20.0, 26.0 })
+                if (t <= at && at < t + static_cast<double>(block) / rate) engine.toggleCue();
+            const int m = std::min(block, n - i);
+            engine.process(l.data() + i, r.data() + i, ml.data() + i, mr.data() + i, contact.data() + i, m, t);
+            const double pos = engine.getPosition();
+            const double speed = (pos - lastPos) * band / (static_cast<double>(m) / rate);
+            if (engine.isCueUp() != wasCue || (std::floor(t) != std::floor(lastLogged) && std::fmod(std::floor(t), 2.0) == 0.0)) {
+                std::printf("    cue t=%5.2f  cue %s  stylus %.4f  speed %5.2f mm/s  contact %.2f\n", t,
+                    engine.isCueUp() ? "up  " : "down", pos, speed * 1000.0, contact[i]);
+                lastLogged = t;
+                wasCue = engine.isCueUp();
+            }
+            lastPos = pos;
+        }
+        printTimeline("cartridge", l, r, rate, -50.0);
+        printTimeline("mechanics", ml, mr, rate, -50.0);
+        printTimeline("mech -70", ml, mr, rate, -70.0);
+        std::printf("    contact   ");
+        for (int i = 1; i < n; ++i)
+            if ((contact[i] > 0.5f) != (contact[i - 1] > 0.5f))
+                std::printf(" %.2fs:%s", static_cast<double>(i) / rate, contact[i] > 0.5f ? "on" : "off");
+        std::printf("\n");
+        printBands("cue up", ml, rate, 9.0, 10.5);
+        printBands("traverse", ml, rate, 13.0, 16.0);
+        writeWav(dir + "/cue_mechanics.wav", ml, mr, rate);
+        writeWav(dir + "/cue.wav", l, r, rate);
+    }
+
     p = EngineParams {}; sc = legacyScratches(1, 0, 0.6, 2);
     render(dir, "all_default", p, sc, seconds);
     render(dir, "all_default_44k", p, sc, seconds, 44100);

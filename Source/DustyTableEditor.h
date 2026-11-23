@@ -39,6 +39,11 @@ public:
     void mouseExit(const juce::MouseEvent&) override;
     // Called by the editor at the display rate.
     void tick();
+    // The Drop point knob is being dragged: a see-through arm shows where the
+    // arm will be set down. It fades out once the value is settled (knob let
+    // go, or no further change for a moment when set by wheel or automation).
+    void setDropPointDragging(bool dragging);
+    float getDropGhostAlpha() const { return ghostAlpha; }
 
     static void drawToolIcon(juce::Graphics&, DiscTool, juce::Rectangle<float> area);
 
@@ -54,6 +59,8 @@ private:
         float platterR, scale, discR, armLength, stylusAngle;
     };
     Layout layout() const;
+    // Stylus point and arm angle (screen, from the pivot) with the stylus on the groove at radius r (m).
+    static juce::Point<float> stylusPointAt(const Layout& l, double r);
     // Disc angle under a screen angle; the disc turns clockwise.
     static double discAngle(const Layout& l, float screenAngle);
     static float screenAngle(const Layout& l, double theta);
@@ -98,6 +105,31 @@ private:
     std::vector<float> mottle;
     juce::Image dustImage;
     float dustImageLevel = -1.0f;
+
+    // See-through arm at the Drop point.
+    bool dropDragging = false;
+    float lastDropPoint = -1.0f;
+    double lastDropChange = -1.0e9;
+    float ghostAlpha = 0.0f;
+};
+
+// Two-way switch for the stylus tip. Each side shows the tip's footprint in a
+// groove seen from above: round (conical) or narrow (elliptical).
+class StylusSwitch : public juce::Component, public juce::SettableTooltipClient {
+public:
+    explicit StylusSwitch(juce::RangedAudioParameter& param);
+    void paint(juce::Graphics&) override;
+    void mouseDown(const juce::MouseEvent&) override;
+    void mouseMove(const juce::MouseEvent&) override;
+    void mouseExit(const juce::MouseEvent&) override;
+    int getSelectedIndex() const { return selected; }
+
+    static void drawTip(juce::Graphics&, int stylusIndex, juce::Rectangle<float> area, bool on);
+
+private:
+    int segmentAt(juce::Point<float> pos) const;
+    juce::ParameterAttachment attachment;
+    int selected = 0, hovered = -1;
 };
 
 class DustyTableEditor : public juce::AudioProcessorEditor, private juce::Timer {
@@ -134,9 +166,11 @@ private:
     std::vector<Section> sections;
 
     juce::TextButton rpm33 { "33" }, rpm45 { "45" };
-    juce::ComboBox discBox, stylusBox;
+    juce::ComboBox discBox;
+    StylusSwitch stylusSwitch;
     juce::TextButton startButton { "START" }, stopButton { "STOP" };
-    std::unique_ptr<juce::AudioProcessorValueTreeState::ComboBoxAttachment> discAttachment, stylusAttachment;
+    juce::TextButton cueButton { "UP/DOWN" }; // no state: the arm knows whether it is up
+    std::unique_ptr<juce::AudioProcessorValueTreeState::ComboBoxAttachment> discAttachment;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(DustyTableEditor)
 };

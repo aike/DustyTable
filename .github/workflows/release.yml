@@ -1,0 +1,65 @@
+# Builds the Windows VST3 and Standalone and publishes them as a zip on a GitHub Release.
+#
+# Release: bump `project(DustyTable VERSION x.y.z)` in CMakeLists.txt, commit, then
+#   git tag vx.y.z
+#   git push origin vx.y.z
+# Running the workflow by hand (Actions tab) builds and checks the zip without releasing it.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check that the tag matches the project version
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: pwsh
+        run: |
+          $match = Select-String -Path CMakeLists.txt -Pattern 'project\(DustyTable VERSION ([0-9.]+)'
+          $version = $match.Matches[0].Groups[1].Value
+          if ("v$version" -ne "${{ github.ref_name }}") {
+            Write-Error "Tag ${{ github.ref_name }} does not match the project version $version in CMakeLists.txt"
+            exit 1
+          }
+
+      - name: Configure
+        run: cmake -S . -B build -G "Visual Studio 17 2022" -A x64
+
+      - name: Build
+        run: cmake --build build --config Release --parallel --target DustyTable_VST3 DustyTable_Standalone DustyTableUiCheck DustyTableRender
+
+      - name: UI and state checks
+        run: build/DustyTableUiCheck_artefacts/Release/DustyTableUiCheck.exe ui-check
+
+      - name: Package
+        id: package
+        shell: pwsh
+        run: |
+          $name = if ("${{ github.ref_type }}" -eq "tag") { "${{ github.ref_name }}" } else { "dev-$("${{ github.sha }}".Substring(0, 7))" }
+          $dir = "DustyTable-$name-Windows-x64"
+          New-Item -ItemType Directory -Force "$dir/VST3", "$dir/Standalone" | Out-Null
+          Copy-Item -Recurse build/DustyTable_artefacts/Release/VST3/DustyTable.vst3 "$dir/VST3/"
+          Copy-Item build/DustyTable_artefacts/Release/Standalone/DustyTable.exe "$dir/Standalone/"
+          Copy-Item LICENSE, README.md, README.en.md "$dir/"
+          Compress-Archive -Path $dir -DestinationPath "$dir.zip"
+          "zip=$dir.zip" >> $env:GITHUB_OUTPUT
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.package.outputs.zip }}
+          path: ${{ steps.package.outputs.zip }}
+
+      - name: Publish the release
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "${{ github.ref_name }}" "${{ steps.package.outputs.zip }}" --title "DustyTable ${{ github.ref_name }}" --generate-notes

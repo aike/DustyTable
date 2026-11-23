@@ -88,6 +88,7 @@ void DustyTableProcessor::prepareToPlay(double sampleRate, int samplesPerBlock)
     }
     engine.setArmImmediate(p.armDown);
     if (const double s = savedStylus.exchange(-1.0); s >= 0.0) engine.setStylusPosition(s);
+    engine.setCueImmediate(savedCue.exchange(-1) == 1);
     armImmediatePending = false;
     noise.setSize(5, samplesPerBlock);
     noiseGain.reset(sampleRate, 0.05);
@@ -119,7 +120,9 @@ void DustyTableProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce::M
     if (armImmediatePending.exchange(false)) {
         engine.setArmImmediate(params.armDown);
         if (const double s = savedStylus.exchange(-1.0); s >= 0.0) engine.setStylusPosition(s);
+        engine.setCueImmediate(savedCue.exchange(-1) == 1);
     }
+    for (int k = cueToggleRequests.exchange(0); k > 0; --k) engine.toggleCue();
     {
         // Never wait on the editor: a change missed here is picked up next block.
         const juce::SpinLock::ScopedTryLockType lock(scratchLock);
@@ -158,6 +161,7 @@ void DustyTableProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce::M
     uiLifterRaised.store(engine.isLifterRaised());
     uiMotorRunning.store(engine.isMotorRunning());
     uiClamped.store(engine.isClamped());
+    uiCueUp.store(engine.isCueUp());
 
     noiseGain.setTargetValue(juce::Decibels::decibelsToGain(param("noise")));
     mechanicsGain.setTargetValue(juce::Decibels::decibelsToGain(param("mech")));
@@ -200,6 +204,7 @@ namespace {
 
 const char* const scratchesTag = "SCRATCHES";
 const char* const stylusAttribute = "stylusPosition";
+const char* const cueAttribute = "cueLifted";
 
 struct ScratchField {
     const char* name;
@@ -209,6 +214,7 @@ constexpr ScratchField scratchFields[] = {
     { "angle", &dustytable::DrawnScratch::angle },
     { "twist", &dustytable::DrawnScratch::twist },
     { "bend", &dustytable::DrawnScratch::bend },
+    { "tilt", &dustytable::DrawnScratch::tilt },
     { "start", &dustytable::DrawnScratch::uStart },
     { "end", &dustytable::DrawnScratch::uEnd },
     { "width", &dustytable::DrawnScratch::widthMicrons },
@@ -241,6 +247,8 @@ void DustyTableProcessor::getStateInformation(juce::MemoryBlock& destData)
     }
     // Where the stylus is, so that a session saved mid-side resumes there.
     xml->setAttribute(stylusAttribute, juce::String(uiPosition.load(), 9));
+    // Whether the arm was cued up over the record (it is then held up there on reload).
+    xml->setAttribute(cueAttribute, uiCueUp.load() ? 1 : 0);
     copyXmlToBinary(*xml, destData);
 }
 
@@ -280,6 +288,8 @@ void DustyTableProcessor::setStateInformation(const void* data, int sizeInBytes)
             // Only used if the arm was on the record (see processBlock).
             savedStylus = xml->getDoubleAttribute(stylusAttribute, -1.0);
             xml->removeAttribute(stylusAttribute);
+            savedCue = xml->getIntAttribute(cueAttribute, 0) != 0 ? 1 : 0;
+            xml->removeAttribute(cueAttribute);
 
             auto state = juce::ValueTree::fromXml(*xml);
             if (!state.hasType(apvts.state.getType())) {

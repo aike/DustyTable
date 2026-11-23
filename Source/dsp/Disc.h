@@ -70,6 +70,9 @@ struct Scratch {
     double angle; // disc angle at rStart
     double twist; // angle change from rStart to rEnd (scratches are rarely exactly radial)
     double bend;  // extra bow in the middle of the span, in radians
+    // Straight cuts: signed distance (m) of the cut's line from the disc centre
+    // (0 = radial). A non-zero twist or bend only comes from older sessions.
+    double lineOffset;
     double rStart, rEnd;
     double width, depth, burr;
     double bulgeWidth, bulgeHeight; // half-width and height of the pile-up around the cut
@@ -79,7 +82,14 @@ struct Scratch {
     double angleAt(double r) const
     {
         const double s = (r - rStart) / (rEnd - rStart);
-        return angle + twist * s + bend * 4.0 * s * (1.0 - s);
+        double a = angle + twist * s + bend * 4.0 * s * (1.0 - s);
+        if (lineOffset != 0.0) {
+            // A point at radius r on a line passing lineOffset from the centre.
+            const double p = std::fabs(lineOffset);
+            const double line = std::acos(std::fmin(1.0, p / r)) - std::acos(std::fmin(1.0, p / rStart));
+            a += lineOffset > 0.0 ? line : -line;
+        }
+        return a;
     }
 };
 
@@ -91,6 +101,7 @@ using ScratchSet = std::array<Scratch, maxScratches>;
 // (0 = inner end, 1 = outer end) and its random shape as factors.
 struct DrawnScratch {
     double angle = 0.0, twist = 0.0, bend = 0.0;
+    double tilt = 0.0; // angle between the (straight) cut and the radius through its middle
     double uStart = 0.0, uEnd = 1.0;
     double widthMicrons = 80.0;
     double depthFactor = 0.75, burrFactor = 0.25;
@@ -141,6 +152,8 @@ inline Scratch buildScratch(const DrawnScratch& d, int discIndex, double depthMi
     s.bend = d.bend;
     s.rStart = g.innerGroove + d.uStart * band;
     s.rEnd = std::fmax(s.rStart + 1e-6, g.innerGroove + d.uEnd * band);
+    const double offset = 0.5 * (s.rStart + s.rEnd) * std::sin(d.tilt);
+    s.lineOffset = std::fmax(-0.95 * s.rStart, std::fmin(0.95 * s.rStart, offset));
     s.width = d.widthMicrons * 1e-6;
     s.depth = depthMicrons * d.depthFactor * 1e-6;
     s.burr = s.depth * d.burrFactor;
@@ -163,14 +176,14 @@ inline DrawnScratch cutScratch(int discIndex, double r, double theta, double fra
     const double u = std::fmin(1.0, std::fmax(0.0, (r - g.innerGroove) / band));
     d.uStart = std::fmin(1.0 - fraction, std::fmax(0.0, u - 0.5 * fraction));
     d.uEnd = d.uStart + fraction;
-    // Longer cuts wander further from the radial line.
-    const double wander = std::fmin(1.0, fraction / 0.5);
-    d.twist = (rng.uniform() - 0.5) * 0.3 * wander;
-    d.bend = (rng.uniform() - 0.5) * 0.16 * wander;
+    // A straight cut, a little off the radial direction.
+    d.tilt = (rng.uniform() - 0.5) * 0.4;
+    rng.uniform(); // was the bend of curved cuts; keeps the shape factors below as before
     randomiseScratchShape(d, rng);
     // Keep the point under the nail on the cut.
-    const double s = (std::fmin(d.uEnd, std::fmax(d.uStart, u)) - d.uStart) / fraction;
-    d.angle = theta - d.twist * s - d.bend * 4.0 * s * (1.0 - s);
+    const Scratch built = buildScratch(d, discIndex, 1.0, 1.0);
+    const double rOnCut = std::fmin(built.rEnd, std::fmax(built.rStart, r));
+    d.angle = theta - built.angleAt(rOnCut);
     d.angle -= twoPi * std::floor(d.angle / twoPi);
     return d;
 }

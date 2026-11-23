@@ -28,8 +28,10 @@ public:
     void armStop(double speed);
     // Impulse (N s) delivered by a contact during the current output sample.
     void addImpulse(Contact contact, double impulse);
-    // Forces the running cam motor puts into its mount and gearbox this sample.
-    void drive(const CamMotor& motor);
+    // The deck's three geared motors (all of the same type, in the same gearbox housing).
+    enum class Drive { ArmCam, CueCam, Traverse };
+    // Forces a running motor puts into its mount and gearbox this sample.
+    void drive(const CamMotor& motor, Drive which = Drive::ArmCam);
     // Height of the cam track under the follower lever (m) and the cam phase, this sample.
     void follow(double trackHeight, double camPhase);
     void render(float& left, float& right);
@@ -120,9 +122,12 @@ private:
     static constexpr Excitation leverNominal { { { { Lever, 1.0 }, { Gearbox, 0.05 }, { Base, 0.35 }, { LifterPost, 0.1 } } }, 4 };
     Excitation leverTarget {};
     std::vector<double> camRoughness;
-    std::array<double, CamMotor::wheelTeeth> wheelError {};
-    std::array<double, CamMotor::pinionTeeth> pinionError {};
-    std::array<double, CamMotor::camTeeth> camGearError {};
+    // Per drive: tooth errors of its moulded gears and the state of its rubber mounts.
+    struct DriveTrain {
+        std::vector<double> wheelError, pinionError, gearError;
+        Biquad grommetFilter;
+    };
+    std::array<DriveTrain, 3> drives;
     static constexpr double clampMass = 0.45e-3; // spring strip with its hook (kg)
 
     std::array<double, 2> pendingContact { 0.0, 0.0 };
@@ -132,7 +137,6 @@ private:
     double pendingTrack = 0.0, pendingPhase = 0.0;
     bool trackValid = false;
     std::array<double, PartCount> lastVelocity {};
-    Biquad grommetFilter;
     double dcL = 0.0, dcR = 0.0, dcCoeff = 0.0;
     Rng rng { 2718 };
 };

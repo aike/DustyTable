@@ -49,6 +49,11 @@ public:
     std::atomic<bool> uiLifterRaised { false };
     std::atomic<bool> uiMotorRunning { false };
     std::atomic<bool> uiClamped { false };
+    std::atomic<bool> uiCueUp { false }; // the cue mechanism holds (or is raising) the arm
+
+    // The UP/DOWN button. It carries no state of its own: each press asks the
+    // arm to go the other way (only while the deck is started).
+    void requestCueToggle() { ++cueToggleRequests; }
 
     // Scratches cut by hand on the editor's disc. Any thread may call these;
     // the audio thread picks up changes at the start of the next block.
@@ -64,6 +69,8 @@ private:
     juce::SmoothedValue<float> noiseGain, mechanicsGain, dryGain;
     std::atomic<bool> armImmediatePending { false };
     std::atomic<double> savedStylus { -1.0 }; // stylus position from a loaded session, -1 = none
+    std::atomic<int> savedCue { -1 };         // arm cued up in a loaded session: 1 / 0, -1 = none
+    std::atomic<int> cueToggleRequests { 0 };
     void handleAsyncUpdate() override;
 
     mutable juce::SpinLock scratchLock;

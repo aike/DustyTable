@@ -23,6 +23,8 @@ constexpr double referenceLevel = 0.125;      // ... plays back at -18 dBFS
 constexpr double crosstalk = 0.056;           // -25 dB channel separation
 constexpr double targetInternalRate = 352800.0;
 constexpr double platterSpinUpSeconds = 0.8;   // belt drive, well inside the 1 s START delay
+constexpr double traverseStartError = 0.2e-3; // m: the arm traverse starts when the drop point is further away
+constexpr double traverseCoastSeconds = 0.05;  // braked motor run-down, as stylus travel / speed
 constexpr double platterSpinDownSeconds = 2.5; // coasting against the brake pad
 constexpr double minDustMicrons = 0.3;
 constexpr double dustSizeExponent = 1.5;      // Pareto: small particles are far more common
@@ -115,12 +117,23 @@ void VinylEngine::setArmImmediate(bool down)
     landed = down;
     position = std::clamp(params.dropPosition, 0.0, 1.0);
     endOfSide = endOfSidePending = false;
+    traverseDirection = 0;
     settleStylus();
 }
 
 void VinylEngine::setStylusPosition(double p)
 {
     if (landed) position = std::clamp(p, 0.0, 1.0);
+}
+
+void VinylEngine::setCueImmediate(bool up)
+{
+    if (!params.armDown || !up) return;
+    arm.setCueImmediate(true);
+    lastLifter = arm.lifterHeight();
+    contactSmoothed = 0.0;
+    traverseDirection = 0;
+    settleStylus();
 }
 
 void VinylEngine::setParams(const EngineParams& p)
@@ -344,7 +357,25 @@ void VinylEngine::process(float* left, float* right, float* mechanicsL, float* m
         const double speed = omega * platterSpeed * radius;
         const double step = speed * dtHigh;
 
+        // Cued up over the record, the arm is turned towards the drop point. The
+        // motor is cut a little early so that it coasts to a stop on the spot.
+        const double band = geom.outerGroove - geom.innerGroove;
+        if (arm.cueHolding() && landed) {
+            const double error = (params.dropPosition - position) * band; // m, positive = inward
+            const double coast = std::abs(arm.traverseSpeed()) * traverseCoastSeconds;
+            if (traverseDirection == 0) {
+                if (std::abs(error) > traverseStartError) traverseDirection = error > 0.0 ? 1 : -1;
+            } else if (error * traverseDirection <= coast) {
+                traverseDirection = 0;
+            }
+        } else {
+            traverseDirection = 0;
+        }
+        arm.setTraverse(traverseDirection);
+
         const int armEvents = arm.tick();
+        if (landed && arm.traverseMetres() != 0.0)
+            position = std::clamp(position + arm.traverseMetres() / band, 0.0, 1.0);
         for (int e = 0; e < armEvents; ++e) {
             using E = ArmSequencer::Event;
             using G = Mechanics::Gesture;
@@ -465,6 +496,8 @@ void VinylEngine::process(float* left, float* right, float* mechanicsL, float* m
         mechanics.addImpulse(Mechanics::Contact::Lifter, forces.lifter * dtHigh);
         mechanics.addImpulse(Mechanics::Contact::Cradle, forces.cradle * dtHigh);
         mechanics.drive(arm.getMotor());
+        if (arm.getCueMotor().running()) mechanics.drive(arm.getCueMotor(), Mechanics::Drive::CueCam);
+        if (arm.getTraverseMotor().running()) mechanics.drive(arm.getTraverseMotor(), Mechanics::Drive::Traverse);
         mechanics.render(mechanicsL[i], mechanicsR[i]);
 
         const double groove = std::clamp(forces.groove / (2.0 * oversampling * preload), 0.0, 1.0);

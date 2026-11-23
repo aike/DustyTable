@@ -130,7 +130,7 @@ void Mechanics::prepare(double newSampleRate, int newOversampling)
         const double canArea = 2.0 * radius * 0.025;
         const double bounce = std::sqrt(grommetStiffness / mass) / twoPi;
         addMode(Motor, bounce, mass, 4.0, canArea, corner);
-        grommetFilter = Biquad::lowpass(sampleRate, bounce, 4.0);
+        for (auto& d : drives) d.grommetFilter = Biquad::lowpass(sampleRate, bounce, 4.0);
         const double shell = wall / (twoPi * radius * radius) * std::sqrt(steelE / (12.0 * steelRho * (1.0 - 0.09)));
         for (int n = 2; n <= 3; ++n)
             addMode(Motor, shell * n * (n * n - 1.0) / std::sqrt(n * n + 1.0), 0.004, 60.0, canArea, corner);
@@ -175,9 +175,18 @@ void Mechanics::prepare(double newSampleRate, int newOversampling)
 
     // Moulded parts: every tooth and every stretch of the cam track has its own error.
     Rng shape(1729);
-    for (auto& e : wheelError) e = shape.gauss();
-    for (auto& e : pinionError) e = shape.gauss();
-    for (auto& e : camGearError) e = shape.gauss();
+    const CamMotor::Gearing gearings[] = { CamMotor::armCam, ArmSequencer::cueGearing, ArmSequencer::traverseGearing };
+    Rng otherShapes(1733); // the arm cam keeps the errors it always had
+    for (size_t k = 0; k < drives.size(); ++k) {
+        auto& d = drives[k];
+        Rng& r = k == 0 ? shape : otherShapes;
+        d.wheelError.assign(static_cast<size_t>(gearings[k].wheelTeeth), 0.0);
+        d.pinionError.assign(static_cast<size_t>(gearings[k].pinionTeeth), 0.0);
+        d.gearError.assign(static_cast<size_t>(gearings[k].gearTeeth), 0.0);
+        for (auto& e : d.wheelError) e = r.gauss();
+        for (auto& e : d.pinionError) e = r.gauss();
+        for (auto& e : d.gearError) e = r.gauss();
+    }
     camRoughness.assign(roughnessPoints, 0.0);
     {
         // Surface texture with a correlation length of a few tens of microns.
@@ -209,7 +218,7 @@ void Mechanics::reset()
     leverTarget = leverNominal;
     trackValid = false;
     pendingContact = { 0.0, 0.0 };
-    grommetFilter.reset();
+    for (auto& d : drives) d.grommetFilter.reset();
     dcL = dcR = 0.0;
 }
 
@@ -437,8 +446,10 @@ void Mechanics::addImpulse(Contact contact, double impulse)
     pendingContact[contact == Contact::Lifter ? 0 : 1] += impulse;
 }
 
-void Mechanics::drive(const CamMotor& motor)
+void Mechanics::drive(const CamMotor& motor, Drive which)
 {
+    auto& train = drives[static_cast<size_t>(which)];
+    const auto& gearing = motor.getGearing();
     const double dt = 1.0 / sampleRate;
     const Excitation mount { { { { Motor, 1.0 }, { Gearbox, 0.0 }, { Base, 0.0 }, { Base, 0.0 } } }, 1 };
     const Excitation grommets { { { { Base, 1.0 }, { Gearbox, 0.0 }, { Base, 0.0 }, { Base, 0.0 } } }, 1 };
@@ -467,15 +478,16 @@ void Mechanics::drive(const CamMotor& motor)
     excite(mount, motorForce * dt);
     // The rubber grommets pass the motor's shaking to the chassis only below
     // their bounce resonance (second-order roll-off above it).
-    excite(grommets, grommetFilter.process(motorForce) * dt);
+    excite(grommets, train.grommetFilter.process(motorForce) * dt);
 
     // Tooth loads fluctuate with each tooth engagement (transmission error).
     const double load = motor.gearTorque();
     const double wormForce = load / 3e-3;                          // 3 mm worm radius
-    const double spurForce = load * CamMotor::wormRatio * 0.4 / 4e-3; // 40 % worm efficiency, 4 mm pinion
-    const double worm = toothError(motor.wormMesh(), wheelError[tooth(motor.wormMesh(), CamMotor::wheelTeeth)]);
+    const double spurForce = load * gearing.wormRatio * 0.4 / 4e-3; // 40 % worm efficiency, 4 mm pinion
+    const double worm = toothError(motor.wormMesh(), train.wheelError[tooth(motor.wormMesh(), gearing.wheelTeeth)]);
     const double spur = toothError(motor.spurMesh(),
-        pinionError[tooth(motor.spurMesh(), CamMotor::pinionTeeth)] + camGearError[tooth(motor.spurMesh(), CamMotor::camTeeth)]);
+        train.pinionError[tooth(motor.spurMesh(), gearing.pinionTeeth)]
+            + train.gearError[tooth(motor.spurMesh(), gearing.gearTeeth)]);
     excite(mesh, 2.2 * (wormForce * worm + spurForce * spur) * dt);
 }
 
