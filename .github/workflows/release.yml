@@ -18,7 +18,7 @@ jobs:
   windows:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Check that the tag matches the project version
         if: startsWith(github.ref, 'refs/tags/')
@@ -31,8 +31,15 @@ jobs:
             exit 1
           }
 
+      - name: Show the toolchain
+        shell: pwsh
+        run: |
+          cmake --version
+          & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property displayName
+
+      # No fixed generator: CMake picks the Visual Studio installed on the runner image.
       - name: Configure
-        run: cmake -S . -B build -G "Visual Studio 17 2022" -A x64
+        run: cmake -S . -B build -A x64
 
       - name: Build
         run: cmake --build build --config Release --parallel --target DustyTable_VST3 DustyTable_Standalone DustyTableUiCheck DustyTableRender
@@ -53,7 +60,7 @@ jobs:
           Compress-Archive -Path $dir -DestinationPath "$dir.zip"
           "zip=$dir.zip" >> $env:GITHUB_OUTPUT
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v5
         with:
           name: ${{ steps.package.outputs.zip }}
           path: ${{ steps.package.outputs.zip }}
